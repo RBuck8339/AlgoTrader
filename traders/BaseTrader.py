@@ -76,6 +76,8 @@ class BaseTrader(ABC):
             extended_hours (bool): Whether to allow extended hours trading
             stop_loss (float): The stop loss price (will likely implement serpate logic for the strategy itself)
             
+        returns:
+            res: The result from placing the order, likely won't return this in later commits
         """
         # Shouldn't need the lower, but to be safe for later development
         side_enum = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
