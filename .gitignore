@@ -425,3 +425,9 @@ venv/
 *.pyc
 __pycache__/
 .env/
+
+# Data and secrets
+backtesting/data/*
+traders/NN_Traders/*
+traders/RL_Traders/*
+traders/TA_Traders/*
