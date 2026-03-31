@@ -1,18 +1,16 @@
 import requests
 from dotenv import load_dotenv
 import os
-import datetime
-import time
 from abc import ABC, abstractmethod
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, StopLossRequest
+from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # ENV Variables
 load_dotenv()
 ALPACA_KEY = os.getenv("ALPACA_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET")
-USING_PAPER = bool(os.getenv("USING_PAPER"))
+USING_PAPER = os.getenv("USING_PAPER")
 
 
 class BaseTrader(ABC):
@@ -28,15 +26,14 @@ class BaseTrader(ABC):
         self.trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=USING_PAPER)
         self.headers = {
             "accept": "application/json",
-            "APCA-API-KEY-ID": ALPACA_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET
+            "APCA-API-KEY-ID": "YOUR_API_KEY_ID",
+            "APCA-API-SECRET-KEY": "YOUR_API_SECRET_KEY"
         }
-        
-        # Get the trading hours
-        self.trade_start = os.getenv("TRADE_START", "09:30")
-        self.trade_end = os.getenv("TRADE_END", "16:00")
-        self.trade_start = datetime.datetime.strptime(self.trade_start, "%H:%M").time()
-        self.trade_end = datetime.datetime.strptime(self.trade_end, "%H:%M").time()
+
+    def get_account_value(self):
+        # TODO Retrieve these values
+        self.starting_portfolio_value = 0
+        self.portfolio_value = self.starting_portfolio_value
         
         
     def verify_account(self):
@@ -63,107 +60,46 @@ class BaseTrader(ABC):
         raise NotImplementedError("Subclasses must implement check_signals method for their strategy")
         
         
-    def place_trade_order(self, order_type, symbol, qty, side, time_in_force, stop_price=None, limit_price=None, extended_hours=False, stop_loss=None):
-        """
-        params:
-            order_type (str): The order type to make ['market', 'limit', 'stop', 'stop_limit']
-            symbol (str): The stock symbol to trade
-            qty (float/int): The number of shares (fractional allowed for market orders)
-            side (str): 'buy' or 'sell'
-            time_in_foce (str): 'day' or 'gtc'
-            stop_price (float): The stop price for stop or stop-limit orders
-            limit_price (float): The limit price for limit or stop-limit orders
-            extended_hours (bool): Whether to allow extended hours trading
-            stop_loss (float): The stop loss price (will likely implement serpate logic for the strategy itself)
-            
-        returns:
-            res: The result from placing the order, likely won't return this in later commits
-        """
-        # Shouldn't need the lower, but to be safe for later development
-        side_enum = OrderSide.BUY if side.lower() == 'buy' else OrderSide.SELL
-        time_in_force_enum = TimeInForce.DAY if time_in_force.lower() == 'day' else TimeInForce.GTC
-        
-        if order_type == 'market':
-            order_data = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,  # Choosing to use qty instead of notional
-                side=side_enum,
-                time_in_force=time_in_force_enum,
-                extended_hours=extended_hours,
-            )
-        # Instead of using StopLossRequest() likely a good idea to place a limit order with stop loss logic
-        elif order_type == 'limit':
-            if limit_price is None:
-                raise ValueError("limit_price is required for limit orders")
-            order_data = LimitOrderRequest(
-                symbol=symbol,
-                qty=qty,  # Choosing to use qty instead of notional
-                side=side_enum,
-                time_in_force=time_in_force_enum,
-                extended_hours=extended_hours,
-                limit_price=limit_price
-            ) 
-        elif order_type == 'stop': 
-            if stop_price is None:
-                raise ValueError("stop_price is required for stop orders")
-            order_data = StopOrderRequest(
-                symbol=symbol,
-                qty=qty,  # Choosing to use qty instead of notional
-                side=side_enum,
-                time_in_force=time_in_force_enum,
-                extended_hours=extended_hours,
-                stop_price=stop_price
-            ) 
-        elif order_type == 'stop_limit':
-            if limit_price is None or stop_price is None:
-                raise ValueError("Both limit_price and stop_price are required for stop-limit orders")
-            order_data = StopLimitOrderRequest(
-                symbol=symbol,
-                qty=qty,  # Choosing to use qty instead of notional
-                side=side_enum,
-                time_in_force=time_in_force_enum,
-                extended_hours=extended_hours,
-                stop_price=stop_price,
-                limit_price=limit_price
-            ) 
-        else:
-            raise ValueError("Invalid order type specified")
-        
-        
-        res = self.trading_client.submit_order(order_data)
-        return res
-        # Decide what to do with this information
-        
-    
-    def place_option_order(self):
+    def place_order(self):
         pass 
-    
+
+
+    def place_short(self):
+        pass 
+
+
+    def calculate_stop_loss(self, buy_amt, tolerance, pl_ratio):
+        stop_loss = (buy_amt - tolerance) / pl_ratio  # Assuming tolerance is not worked out to be per-share
+        return stop_loss 
+        
         
     def results_for_day(self):
         """
         Get the results for the day; optionally send to a csv/database
         """
         pass 
-    
-    
-    def run(self):
-        print(f"Trading window: {self.trade_start} → {self.trade_end}")
 
+    def shutdown(self):
+        """ 
+        If we have lost too much money for the day, invoke this function and shutdown for the day
+        Log so that I can fix it
+        """
+        pass
+
+    
+    def main(self):
+        """
+        The actual logic for a trading day 
+        """
+        self.portfolio_stop_value = 0  # Need to set up
         while True:
-            now = datetime.datetime.now().time()
+            # Make sure we are still able to trade for the day
+            if self.portfolio_stop_value <= self.portfolio_value:
+                self.shutdown()
 
-            # Before market opens
-            if now < self.trade_start:
-                print("Market not open yet — waiting...")
-                time.sleep(60)
-                continue
+            res = self.check_signals()  # 'BUY', 'SELL', 'HOLD', 'WAIT'
+            # 'HOLD' vs 'WAIT' is mainly for debugging and logging, but serve similar purposes
 
-            # After market closes
-            if now >= self.trade_end:
-                print("Market closed — stopping trading.")
-                break
-
-            # Main trading logic
-            self.check_signals()
-
-        self.results_for_day()
+            if res == 'BUY' or res == 'SELL':
+                self.place_order(res)
+            # In other cases we do nothing (else eats up time)
