@@ -1,10 +1,15 @@
+import asyncio
+
 import requests
 from dotenv import load_dotenv
 import os
+import pandas as pd
 from abc import ABC, abstractmethod
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from scrapers.stream.KrakenScraper import KrakenScraper
+import time 
 
 # ENV Variables
 load_dotenv()
@@ -30,6 +35,21 @@ class BaseTrader(ABC):
             "APCA-API-SECRET-KEY": "YOUR_API_SECRET_KEY"
         }
 
+        # Need to adjust the data based on what kind of commodity we are trading
+        self.ohlc_data = pd.DataFrame(columns=["open", "high", "low", "close", "volume", "vwap", "timestamp"])
+        self.trade_data = pd.DataFrame(columns=["side", "price", "qty", "timestamp", "trade_id"])  # Might want to change format and aggregate by day or smth
+
+        data_type = 'crypto'  # Using only crypto for now
+        if data_type == 'crypto':
+            self.scraper = KrakenScraper(
+                ticker="BTC/USD",
+                stream_type="ohlc",
+                api_secret=os.getenv("DATA_API_SECRET"),
+                api_key=os.getenv("DATA_API_KEY"),
+                on_bar=self.on_new_bar,
+                on_trade=self.on_new_trade
+            )
+
     def get_account_value(self):
         # TODO Retrieve these values
         self.starting_portfolio_value = 0
@@ -50,7 +70,7 @@ class BaseTrader(ABC):
             print(response.text)
         else:
             raise ConnectionError("Failed to connect to Alpaca account")
-        
+    
     
     @abstractmethod
     def check_signals(self):
@@ -84,14 +104,17 @@ class BaseTrader(ABC):
         If we have lost too much money for the day, invoke this function and shutdown for the day
         Log so that I can fix it
         """
+        # Need to stop data stream safely
         pass
 
     
-    def main(self):
+    async def main(self):
         """
         The actual logic for a trading day 
         """
-        self.portfolio_stop_value = 0  # Need to set up
+        asyncio.create_task(self.scraper.stream()) 
+
+        self.portfolio_stop_value = -1  # Need to set up
         while True:
             # Make sure we are still able to trade for the day
             if self.portfolio_stop_value <= self.portfolio_value:
@@ -100,6 +123,32 @@ class BaseTrader(ABC):
             res = self.check_signals()  # 'BUY', 'SELL', 'HOLD', 'WAIT'
             # 'HOLD' vs 'WAIT' is mainly for debugging and logging, but serve similar purposes
 
+            
+
             if res == 'BUY' or res == 'SELL':
-                self.place_order(res)
+                # Information for making the trade
+                stop_loss = self.calculate_stop_loss(buy_amt=0, tolerance=0, pl_ratio=self.pl_ratio)  # Need to set up buy_amt and tolerance
+
+
+                #self.place_order(res)
+            await asyncio.sleep(1)
             # In other cases we do nothing (else eats up time)
+
+
+    def on_new_bar(self, bar_data):
+        """
+        Callback for when a new bar (candle) is received from the data stream
+        """
+        # Convert bar_data to a DataFrame row and append to ohlc_data
+        new_row = pd.DataFrame([bar_data])
+        self.ohlc_data = pd.concat([self.ohlc_data, new_row], ignore_index=True)
+        print(f"Received new bar: {bar_data}")  # DEBUG
+    
+    def on_new_trade(self, trade_data):
+        """
+        Callback for when a new trade is received from the data stream
+        """
+        new_row = pd.DataFrame([trade_data])
+        self.trade_data = pd.concat([self.trade_data, new_row], ignore_index=True)
+        print(f"Received new trade: {trade_data}")  # DEBUG
+
