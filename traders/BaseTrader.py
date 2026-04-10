@@ -27,19 +27,17 @@ class BaseTrader(ABC):
         - Place and manage orders
         - Collect and analyze trading data
     """
-    def __init__(self):
+    def __init__(self, data_type="crypto"):
         self.trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=USING_PAPER)
         self.headers = {
             "accept": "application/json",
-            "APCA-API-KEY-ID": "YOUR_API_KEY_ID",
-            "APCA-API-SECRET-KEY": "YOUR_API_SECRET_KEY"
+            "APCA-API-KEY-ID": ALPACA_KEY,  # Don't even know if i'm using alpaca anymore
+            "APCA-API-SECRET-KEY": ALPACA_SECRET
         }
 
-        # Need to adjust the data based on what kind of commodity we are trading
-        self.ohlc_data = pd.DataFrame(columns=["open", "high", "low", "close", "volume", "vwap", "timestamp"])
-        self.trade_data = pd.DataFrame(columns=["side", "price", "qty", "timestamp", "trade_id"])  # Might want to change format and aggregate by day or smth
-
-        data_type = 'crypto'  # Using only crypto for now
+        # Need to adjust the data based on what kind of commodity we are trading (these are crypto)
+        self.ohlc_data = pd.DataFrame(columns=["open", "high", "low", "close", "volume", "vwap", "timestamp", "count"])
+        self.trade_data = pd.DataFrame(columns=["timestamp", "price", "volume", "buy_sell", "market_limit", "misc"])  # Might want to change format and aggregate by day or sm
         if data_type == 'crypto':
             self.scraper = KrakenScraper(
                 ticker="BTC/USD",
