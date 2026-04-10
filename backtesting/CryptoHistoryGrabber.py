@@ -33,8 +33,13 @@ SLEEP_DELAY = 0.01  # Delay between API requests in seconds
 RATE_LIMIT_WAIT = 5  # Base wait time (in seconds) for rate limit errors (exponential backoff multiplier)
 BATCH_SIZE = 5000  # Number of records to request per API call
 
-OUTPUT_FILE = "backtesting/data/crypto/kraken_{}_{}_data_{}_to_{}.csv"  # Output filename
+OUTPUT_FILE = "backtesting/data/crypto/kraken_{}_{}_{}_data_{}_to_{}.csv"  # Output filename
 
+# For file formatting names
+interval_map = {
+    1: "1m", 5: "5m", 15: "15m", 30: "30m", 60: "1h", 
+    240: "4h", 1440: "1d", 10080: "1w", 21600: "15d"
+}
 
 # Kraken API endpoints
 BASE_URL = "https://api.kraken.com/0/public/"
@@ -248,7 +253,13 @@ def main():
     try:
         start_date = datetime.fromtimestamp(SINCE).strftime('%Y%m%d')
         end_date = datetime.now().strftime('%Y%m%d')
-        filename = OUTPUT_FILE.format(SYMBOL, DATA_TYPE, start_date, end_date)
+        if DATA_TYPE == "ohlc":
+            # Get the label (e.g., "1m") or default to the raw number if not in map
+            interval_label = interval_map.get(INTERVAL, f"{INTERVAL}m")
+            filename = OUTPUT_FILE.format(SYMBOL, interval_label, DATA_TYPE, start_date, end_date)
+        else:
+            # For trades, we skip the interval_str in the filename (this isn't optimal i know)
+            filename = f"backtesting/data/crypto/kraken_{SYMBOL}_{DATA_TYPE}_data_{start_date}_to_{end_date}.csv"
         directory = os.path.dirname(filename)
         if directory and not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
