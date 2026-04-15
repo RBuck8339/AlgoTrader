@@ -84,11 +84,6 @@ class BaseTrader(ABC):
 
     def place_short(self):
         pass 
-
-
-    def calculate_stop_loss(self, buy_amt, tolerance, pl_ratio):
-        stop_loss = (buy_amt - tolerance) / pl_ratio  # Assuming tolerance is not worked out to be per-share
-        return stop_loss 
         
         
     def results_for_day(self):
@@ -150,3 +145,32 @@ class BaseTrader(ABC):
         self.trade_data = pd.concat([self.trade_data, new_row], ignore_index=True)
         print(f"Received new trade: {trade_data}")  # DEBUG
 
+    def get_percent_exits(entry_price, sl_percent=0.02, pl_ratio=2.0):
+        """
+        sl_percent: decimal (e.g., 0.02 for 2%)
+        pl_ratio: 2.0 for 2:1, 3.0 for 3:1
+        """
+        # Stop Loss is entry minus the percentage
+        stop_loss = entry_price * (1 - sl_percent)
+        
+        # Take Profit is entry plus (the risk * ratio)
+        risk_amount = entry_price - stop_loss
+        take_profit = entry_price + (risk_amount * pl_ratio)
+        
+        return round(stop_loss, 2), round(take_profit, 2)
+
+    def get_amount_exits(entry_price, quantity, total_dollar_risk, pl_ratio=2.0):
+        """
+        quantity: number of shares/units bought
+        total_dollar_risk: fixed dollar amount you are okay losing (e.g., $50)
+        """
+        # Risk per unit
+        risk_per_unit = total_dollar_risk / quantity
+
+        # Stop Loss price
+        stop_loss = entry_price - risk_per_unit
+
+        # Take Profit price
+        take_profit = entry_price + (risk_per_unit * pl_ratio)
+
+        return round(stop_loss, 2), round(take_profit, 2)
