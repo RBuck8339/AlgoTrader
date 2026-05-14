@@ -108,10 +108,28 @@ class BaseTrader(ABC):
         asyncio.create_task(self.scraper.stream()) 
 
         self.portfolio_stop_value = -1  # Need to set up
+
+        # Used for stop loss exiting, and for if we have reached a target value and want to escape with profit
+        self.holding = False  
+        self.stop_loss_amt = -1
+        self.stop_profit_amt = -1
+
         while True:
             # Make sure we are still able to trade for the day
             if self.portfolio_stop_value <= self.portfolio_value:
                 self.shutdown()
+
+            curr_price = 0  # Need to set up, but use most recent trade price or close price
+
+            # Check for mandatory buy/sell signals first
+            if self.holding:
+                if curr_price <= self.stop_loss_amt:
+                    pass  # Sell at a loss, and reset logic 
+                elif curr_price >= self.stop_profit_amt:
+                    pass  # Sell at a profit, and reset logic
+                self.holding = False
+
+            # We can still buy on this iteration here
 
             res = self.check_signals()  # 'BUY', 'SELL', 'HOLD', 'WAIT'
             # 'HOLD' vs 'WAIT' is mainly for debugging and logging, but serve similar purposes

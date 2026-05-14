@@ -11,7 +11,7 @@ class SingleMACrossover(BaseTrader):
     def __init__(self, window_size=50):
         super().__init__()
         self.window_size = window_size
-
+        self.signal_on = "candle"  # Strategy uses candles (not trades) to check signals
         self.holding = False  # We will not let this strategy have multiple holdings at once
 
     
@@ -24,12 +24,12 @@ class SingleMACrossover(BaseTrader):
             return 0  # Need 'window_size' days to compute ma here
         
         # Calculate the moving average(s) for past 'window_size' days (should make function; i have a function to do this on an entire df already)
-        ma = MathUtils.sma(self.ohlc_data, self.window_size)
-        crossover = MathUtils.crossover(self.ohlc_data["close"], ma)
+        ma = MathUtils.sma(self.data, self.window_size)
+        crossover = MathUtils.crossover(self.data["close"], ma)
 
         last_cross = crossover.iloc[-1]
-        last_close = self.ohlc_data["close"].iloc[-1]
-        last_ma = ma.iloc[-1]
+        # last_close = self.data["close"].iloc[-1]
+        # last_ma = ma.iloc[-1]
 
         # Test for buy
         if not self.holding:
