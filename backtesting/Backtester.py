@@ -1,32 +1,30 @@
 import os
 import sys
+from datetime import datetime 
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import pandas as pd
 
-from backtesting.CryptoHistoryGrabber import KrakenHistoricalScraper 
+from backtesting.CryptoHistoryGrabber import KrakenHistoricalScraper
 from traders.TA_Traders.MACrossover import SingleMACrossover
+from backtesting.Visualizer import Visualizer
 
 INTERVAL_MAP = {
     1: "1m", 5: "5m", 15: "15m", 30: "30m", 60: "1h",
     240: "4h", 1440: "1d", 10080: "1w", 21600: "15d"
 }
 
-# I want to use this to inspire my backtesting framework
-#   https://www.youtube.com/watch?v=NLBXgSmRBgU
-class Backtester: 
+
+class Backtester:
     def __init__(self):
         self.data_dir = "backtesting/data"
         self.results_dir = "backtesting/results"
-        
-        # For storing results of backtests
-        self.backtest_results_overall = []  # List of dfs
+        self.backtest_results_overall = []
         self.backtest_summary = pd.DataFrame(columns=["module_name", "portfolio_value", "num_trades", "realized_pnl", "total_pnl"])
         self.historical_data = None
 
 
-    # Can tune the risk and pl ratio numbers
     def test_module(self, module, interval=60, risk_percent=0.02, pl_ratio=2.0):
         if self.historical_data is None:
             raise RuntimeError("No historical data loaded. Call load_historical_data() first.")
@@ -36,8 +34,7 @@ class Backtester:
 
         curr_data_ohlc = pd.DataFrame(columns=ohlc_data.columns)
         curr_data_trades = pd.DataFrame(columns=trade_data.columns)
-        
-        backtest_results = pd.DataFrame(columns=["date", "time", "portfolio_value", "live_order", "unrealized_pnl", "realized_pnl", "total_pnl"])
+        backtest_results = pd.DataFrame(columns=["date", "time", "portfolio_value", "live_order", "unrealized_pnl", "realized_pnl", "total_pnl", "trade_made"])
 
         portfolio_value_realized = 100000.0
         holding = False
@@ -45,11 +42,16 @@ class Backtester:
         num_shares_held = 0.0
         buy_amt = 0.0
         curr_price = 0.0
+        entry_bar = 0
+        bar_idx = 0
+        trade_pnl_list = []
+        trade_duration_list = []
 
         for idx_ohlc, row_ohlc in ohlc_data.iterrows():
             curr_data_ohlc.loc[idx_ohlc] = row_ohlc
             curr_time = idx_ohlc
             end_time = curr_time + pd.Timedelta(minutes=interval)
+            bar_idx += 1
 
             current_block_trades = trade_data.loc[
                 (trade_data.index >= curr_time) & (trade_data.index < end_time)
@@ -62,22 +64,31 @@ class Backtester:
                 if module.signal_on == "tick":
                     module.data = curr_data_ohlc.copy()
                     signal = module.check_signals()
-                    holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made = self._execute_signal(
+                    holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar = self._execute_signal(
                         signal, curr_price, holding, portfolio_value_realized,
-                        num_shares_held, stop_loss_price, buy_amt, risk_percent
+                        num_shares_held, stop_loss_price, buy_amt, risk_percent,
+                        bar_idx=bar_idx, entry_bar=entry_bar
                     )
+                    if trade_made and pnl is not None:
+                        trade_pnl_list.append(pnl)
+                        trade_duration_list.append(duration)
 
-            # Candle close
             close_price = float(row_ohlc["close"])
             curr_price = close_price if curr_price == 0.0 else curr_price
 
             if module.signal_on == "candle":
                 module.data = curr_data_ohlc.copy()
                 signal = module.check_signals()
-                holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made = self._execute_signal(
+                holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar = self._execute_signal(
                     signal, close_price, holding, portfolio_value_realized,
-                    num_shares_held, stop_loss_price, buy_amt, risk_percent
+                    num_shares_held, stop_loss_price, buy_amt, risk_percent,
+                    bar_idx=bar_idx, entry_bar=entry_bar
                 )
+                if trade_made and pnl is not None:
+                    trade_pnl_list.append(pnl)
+                    trade_duration_list.append(duration)
+            else:
+                trade_made = False
 
             portfolio_value_unrealized = portfolio_value_realized + (close_price * num_shares_held)
 
@@ -89,7 +100,7 @@ class Backtester:
                 "unrealized_pnl": portfolio_value_unrealized - portfolio_value_realized,
                 "realized_pnl": portfolio_value_realized - 100000.0,
                 "total_pnl": portfolio_value_unrealized - 100000.0,
-                "trade_made": trade_made
+                "trade_made": trade_made,
             }
 
         final_value = portfolio_value_realized + (curr_price * num_shares_held)
@@ -97,64 +108,78 @@ class Backtester:
         print(f"\nBacktest complete. Final portfolio: ${final_value:,.2f}")
         print(f"Total P&L: ${total_pnl:,.2f}")
 
-        return backtest_results, final_value, total_pnl
+        portfolio_series = backtest_results["portfolio_value"]
+        viz_data = {
+            "portfolio_value": portfolio_series,
+            "trade_pnl": pd.Series(trade_pnl_list),
+            "daily_returns": portfolio_series.pct_change().dropna(),
+            "trade_duration": pd.Series(trade_duration_list),
+        }
+
+        return backtest_results, final_value, total_pnl, viz_data
 
 
     def run_backtests(self):
-        # Run backtests for all algorithms, and store results in a csv/database
         modules = [
-            (SingleMACrossover, "candle"),  # All algorithms will have a signal type (this is put here for safety)
+            (SingleMACrossover, "candle", {}),
         ]
 
-        for module, signal_on in modules:
+        for module, signal_on, param_dict in modules:
+            # Run a Bayesian Optimization/Grid Search style loop here to get parameters
             curr_instance = module()
             curr_instance.signal_on = signal_on
-            res, final_value, total_pnl = self.test_module(curr_instance)  # Rest of the settings remain static for now
+            res, final_value, total_pnl, viz_data = self.test_module(curr_instance)
 
-            # Aggregate results and save data
             self.backtest_results_overall.append(res)
 
             curr_agg_data = {
-                "module_name": module.__class__.__name__,
+                "module_name": curr_instance.__class__.__name__,
                 "portfolio_value": final_value,
-                "num_trades": res,
+                "num_trades": len(res[res["trade_made"] == True]),
                 "realized_pnl": res.iloc[-1]["realized_pnl"],
-                "total_pnl": total_pnl
+                "total_pnl": total_pnl,
             }
-            self.backtest_summary.loc[len(self.backtest_summary) - 1] = curr_agg_data
+            self.backtest_summary.loc[len(self.backtest_summary)] = curr_agg_data
 
-        # Need to implement visualization of data, but this works for now
+        # Eventually, goal is to compare multiple methods in the same plots
+
 
     def load_historical_data(self, data_type, ticker, start_date, end_date, frequency):
-        # Load historical data for a given ticker and date range from the data directory
-        # This can be used for backtesting and also for training models
-        
-        # Format for filenames
         interval_label = INTERVAL_MAP.get(frequency, f"{frequency}m")
-        start_str = start_date.strftime('%Y%m%d')
+        
+        safe_ticker = ticker.replace("/", "")
+        since_ts = int(start_date.timestamp())
+        start_dt_normalized = datetime.fromtimestamp(since_ts)
+        start_str = start_dt_normalized.strftime('%Y%m%d')
         end_str = end_date.strftime('%Y%m%d')
 
         if data_type == "stock":
             data_path_ohlc = os.path.join(
                 self.data_dir,
-                f"{ticker}_{interval_label}_ohlc_{start_str}_to_{end_str}.csv"
+                f"{safe_ticker}_{interval_label}_ohlc_{start_str}_to_{end_str}.csv"
             )
             data_path_trades = os.path.join(
                 self.data_dir,
-                f"{ticker}_trades_{start_str}_to_{end_str}.csv"
+                f"{safe_ticker}_trades_{start_str}_to_{end_str}.csv"
             )
             if not os.path.exists(data_path_ohlc):
-                pass  # TODO Implement stock data scraper into here
+                raise FileNotFoundError(f"Stock OHLC data not found: {data_path_ohlc}. Run StockHistoryGrabber.cache() first.")
+
+            self.historical_data = {
+                "ohlc": pd.read_csv(data_path_ohlc, parse_dates=["timestamp"], index_col="timestamp"),
+                "trades": None,
+            }
 
         elif data_type == "crypto":
             data_path_ohlc = os.path.join(
                 self.data_dir, "crypto",
-                f"kraken_{ticker}_{interval_label}_ohlc_{start_str}_to_{end_str}.csv"
+                f"kraken_{safe_ticker}_{interval_label}_ohlc_{start_str}_to_{end_str}.csv"
             )
             data_path_trades = os.path.join(
                 self.data_dir, "crypto",
-                f"kraken_{ticker}_trades_{start_str}_to_{end_str}.csv"
+                f"kraken_{safe_ticker}_trades_{start_str}_to_{end_str}.csv"
             )
+
             if not os.path.exists(data_path_ohlc):
                 print(f"OHLC file not found, scraping...")
                 KrakenHistoricalScraper(
@@ -173,6 +198,7 @@ class Backtester:
                     start_date=start_date,
                     end_date=end_date,
                 ).fetch()
+
             self.historical_data = {
                 "ohlc": pd.read_csv(data_path_ohlc, parse_dates=["timestamp"], index_col="timestamp"),
                 "trades": pd.read_csv(data_path_trades, parse_dates=["timestamp"], index_col="timestamp"),
@@ -185,15 +211,25 @@ class Backtester:
         if self.historical_data["trades"] is not None:
             print(f"Loaded {len(self.historical_data['trades'])} trades for {ticker}")
 
-    
-    def display_results(self):
-        """
-        Goal here is to send results to a CSV and use the Visualizer class to display the results 
-        """
+
+    def display_results(self, ticker, strategy_name, viz_data, asset_type="crypto"):
+        os.makedirs(self.results_dir, exist_ok=True)
+
+        for i, res in enumerate(self.backtest_results_overall):
+            res.to_csv(os.path.join(self.results_dir, f"backtest_{i}.csv"))
+
+        self.backtest_summary.to_csv(os.path.join(self.results_dir, "summary.csv"))
+        print(f"Results saved to {self.results_dir}")
+
+        Visualizer.generate_plots(ticker, strategy_name, viz_data, asset_type=asset_type)
 
 
-    def _execute_signal(self, signal, curr_price, holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, risk_percent):
-        trade_made = False  # By default we have not made a trade
+    def _execute_signal(self, signal, curr_price, holding, portfolio_value_realized,
+                        num_shares_held, stop_loss_price, buy_amt, risk_percent, bar_idx=0, entry_bar=0):
+        # Used for a lot of my visualization stats
+        trade_made = False
+        pnl = None
+        duration = None
 
         if signal == 1 and not holding:
             buy_amt = portfolio_value_realized * risk_percent
@@ -201,31 +237,32 @@ class Backtester:
             stop_loss_price = curr_price * (1 - risk_percent)
             portfolio_value_realized -= buy_amt
             holding = True
-            print(f"  BUY  @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
+            entry_bar = bar_idx
             trade_made = True
+            print(f"  BUY  @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
 
         elif holding and (signal == -1 or curr_price <= stop_loss_price):
             sell_amt = num_shares_held * curr_price
-            realized_pnl = sell_amt - buy_amt
+            pnl = sell_amt - buy_amt
+            duration = bar_idx - entry_bar
             portfolio_value_realized += sell_amt
             holding = False
             num_shares_held = 0.0
             stop_loss_price = -1.0
             buy_amt = 0.0
-            print(f"  SELL @ {curr_price:.2f} | pnl={realized_pnl:.2f}")
             trade_made = True
+            print(f"  SELL @ {curr_price:.2f} | pnl={pnl:.2f}")
 
-        return holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made
+        return holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar
 
 
 if __name__ == "__main__":
-    # Sample usage for loading historical data
     backtester = Backtester()
     backtester.load_historical_data(
         data_type="crypto",
-        ticker="XBTUSD",
+        ticker="XBT/USD",
         start_date=pd.Timestamp("2023-01-01"),
-        end_date=pd.Timestamp("2023-01-10"),
-        frequency=60
+        end_date=pd.Timestamp("2023-01-07"),
+        frequency=60  # Needs tuning based on the model, 60 works for now
     )
     backtester.run_backtests()
