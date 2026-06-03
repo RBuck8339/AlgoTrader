@@ -16,13 +16,20 @@ import hashlib
 import hmac
 import base64
 
+from utils import KrakenUtils
+
 
 # ENV Variables
 load_dotenv()
-ALPACA_KEY = os.getenv("ALPACA_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET")
-USING_PAPER = os.getenv("USING_PAPER")
 
+FEE_RATE = 0.0026  # Kraken's fee rate for crypto trading (can vary based on volume)
+
+# Minimum purchase amounts based on Kraken's requirements (varies by asset, value represented in terms of coins)
+MIN_PURCHASE_AMOUNT = {
+    "BTC/USD": 0.0001,  
+    "ETH/USD": 0.01,
+    "SOL/USD": 0.1,
+}
 
 class BaseTrader(ABC):
     """
@@ -53,8 +60,8 @@ class BaseTrader(ABC):
         self.base_url = "https://api.kraken.com"
         self.data_api_secret = os.getenv("KRAKEN_DATA_KEY_PRIVATE")
         self.data_api_key = os.getenv("KRAKEN_DATA_KEY_PUBLIC")
-        self.starting_portfolio_value = None
-        self.portfolio_value = None
+        self.starting_account_value = None
+        self.account_value = None
 
 
     def on_new_bar(self, candle, interval):
@@ -83,7 +90,8 @@ class BaseTrader(ABC):
         elif last_ts is None:
             self.last_closed_timestamps[interval] = current_ts
             self.ohlc_history[interval].append(candle)
-
+            
+            
     def get_dataframe(self, interval):
         """Helper to instantly generate an analytical dataframe."""
         df = pd.DataFrame(self.ohlc_history[interval])
@@ -91,19 +99,6 @@ class BaseTrader(ABC):
             if col in df.columns:
                 df[col] = df[col].astype(float)
         return df
-            
-    
-    @staticmethod
-    def get_kraken_signature(url_path, data, secret):
-        # For actually interacting with Kraken API, this is necessary
-        postdata = requests.compat.urlencode(data)  # Standardized to web-link text format
-        encoded = (str(data['nonce']) + postdata).encode()  # Add timestamp to front
-        message_hash = hashlib.sha256(encoded).digest()  # SHA256 hash of the above
-        message = url_path.encode() + message_hash
-        mac_key = base64.b64decode(secret)
-        mac = hmac.new(mac_key, message, hashlib.sha512)
-        sigdigest = base64.b64encode(mac.digest())
-        return sigdigest.decode()
             
 
     def get_account_value(self):
@@ -115,7 +110,7 @@ class BaseTrader(ABC):
             "nonce": nonce, 
             "asset": "ZUSD"
         }
-        signature = BaseTrader.get_kraken_signature(url_path, payload, self.data_api_secret)
+        signature = KrakenUtils.get_kraken_signature(url_path, payload, self.data_api_secret)
         headers = {
             "API-Key": self.data_api_key,
             "API-Sign": signature,
@@ -124,10 +119,10 @@ class BaseTrader(ABC):
         
         response = requests.post(url=self.base_url + url_path, headers=headers, data=payload)
         data = response.json()
-        self.starting_portfolio_value = data["result"]["eb"] if self.starting_portfolio_value is None else self.starting_portfolio_value  # Don't overwrite later
-        self.portfolio_value = data["result"]["eb"]
+        self.starting_account_value = data["result"]["eb"] if self.starting_account_value is None else self.starting_account_value  # Don't overwrite later
+        self.account_value = data["result"]["eb"]
         
-        return self.portfolio_value
+        return self.account_value
         
         
     def verify_account(self):
@@ -135,9 +130,177 @@ class BaseTrader(ABC):
         pass
     
     
-    def place_order(self, type='long'):
-        # Place an order, default is long order (optional short)
-        pass 
+    def place_order_live(self, amount: float, ticker: str, action: str, risk_percent=0.02, risk_ratio=2.0):
+        # Place a paper order, default is long order (optional short)
+        """
+        Since kraken doesn't offer paper trading, we just simulate here
+        """
+        curr_ask, curr_bid = self.scraper.get_current_price(ticker)
+        
+        fee_rate = FEE_RATE # Fee is applied on both buy and sell
+        
+        # To open a position
+        if action.split("_")[0] == "BUY" and action in ["BUY_LONG", "BUY_SHORT"]:
+            # Set entry prices based on book spread and figure out how many coins to buy
+            entry_price = curr_ask if action == "BUY_LONG" else curr_bid
+            trade_amount_coins = round(amount / entry_price, 6)
+            
+            # Guard rail check against Kraken volume minimum constraints
+            if trade_amount_coins < MIN_PURCHASE_AMOUNT.get(ticker, 0):
+                print(f"\t[DEBUG: Order Rejected] {trade_amount_coins} coins is below minimum required for {ticker}.")
+                return
+            
+            stop_loss_price = 0
+            take_profit_price = 0
+        
+            if action == "BUY_LONG":
+                # Entry costs your wallet cash + the taker fee
+                total_cost_usd = (trade_amount_coins * entry_price) * (1 + fee_rate)
+                self.account_value -= total_cost_usd 
+                
+                # Setup standard long targets
+                stop_loss_price = round(entry_price * (1 -risk_percent * 1), 2)
+                take_profit_price = round(entry_price * (1 + risk_percent * risk_ratio), 2)
+                print(f"\t[INFO: Open Long] Bought {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
+
+                # TODO API CALL HERE
+                
+            elif action == "BUY_SHORT":
+                # Shorting adds the sold coin revenue to your wallet, minus the fee
+                gross_revenue_usd = trade_amount_coins * entry_price
+                fee_usd = gross_revenue_usd * fee_rate
+                self.account_value += (gross_revenue_usd - fee_usd)
+                
+                # Setup inverted short targets (Loss is up, Profit is down)
+                stop_loss_price = round(entry_price * (1 + risk_percent * 1), 2)
+                take_profit_price = round(entry_price * (1 - risk_percent * risk_ratio), 2)
+                print(f"\t[INFO: Open Short] Shorted {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
+            
+                # TODO API CALL HERE
+            
+            # Place limits on the trade
+            print(f"\t[INFO: Set Targets] Stop Loss at ${stop_loss_price:.2f}, Take Profit at ${take_profit_price:.2f}.")
+            self.place_take_and_stop(stop_loss_price, take_profit_price, trade_id="simulated_trade_id", action='paper')
+
+        # Allows closing trades
+        elif action.split("_")[0] == "SELL" and action in ["SELL_LONG", "SELL_SHORT"]:
+            coins_to_close = amount 
+            
+            if action == "SELL_LONG":
+                # Selling your long position instantly hits the BID
+                exit_price = curr_bid
+                gross_return_usd = coins_to_close * exit_price
+                fee_usd = gross_return_usd * fee_rate
+                
+                # Cash flows back into your wallet minus the transaction fee
+                self.account_value += (gross_return_usd - fee_usd)
+                print(f"\t[INFO: Close Long] Sold {coins_to_close} {ticker} at Bid ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
+                
+                # TODO API CALL HERE
+                
+            elif action == "SELL_SHORT":
+                # Closing a short means buying back the debt instantly at the ASK
+                exit_price = curr_ask
+                gross_buyback_cost = coins_to_close * exit_price
+                fee_usd = gross_buyback_cost * fee_rate
+                
+                # Cash is stripped from your wallet to pay for the buyback + fee
+                self.account_value -= (gross_buyback_cost + fee_usd)
+                print(f"\t[INFO: Close Short] Covered {coins_to_close} {ticker} at Ask ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
+        
+                # TODO API CALL HERE
+        
+        else:
+            raise ValueError("Invalid action specified for live trading")
+    
+    
+    def place_order_paper(self, amount: float, ticker: str, action: str, risk_percent=0.02, risk_ratio=2.0):
+        # Place a paper order, default is long order (optional short)
+        """
+        Since kraken doesn't offer paper trading, we just simulate here
+        """
+        curr_ask, curr_bid = self.scraper.get_current_price(ticker)
+        
+        fee_rate = FEE_RATE # Fee is applied on both buy and sell
+        
+        # To open a position
+        if action.split("_")[0] == "BUY" and action in ["BUY_LONG", "BUY_SHORT"]:
+            # Set entry prices based on book spread and figure out how many coins to buy
+            entry_price = curr_ask if action == "BUY_LONG" else curr_bid
+            trade_amount_coins = round(amount / entry_price, 6)
+            
+            # Guard rail check against Kraken volume minimum constraints
+            if trade_amount_coins < MIN_PURCHASE_AMOUNT.get(ticker, 0):
+                print(f"\t[DEBUG: Order Rejected] {trade_amount_coins} coins is below minimum required for {ticker}.")
+                return
+            
+            stop_loss_price = 0
+            take_profit_price = 0
+        
+            if action == "BUY_LONG":
+                # Entry costs your wallet cash + the taker fee
+                total_cost_usd = (trade_amount_coins * entry_price) * (1 + fee_rate)
+                self.account_value -= total_cost_usd 
+                
+                # Setup standard long targets
+                stop_loss_price = round(entry_price * (1 -risk_percent * 1), 2)
+                take_profit_price = round(entry_price * (1 + risk_percent * risk_ratio), 2)
+                print(f"\t[INFO: Open Long] Bought {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
+
+            elif action == "BUY_SHORT":
+                # Shorting adds the sold coin revenue to your wallet, minus the fee
+                gross_revenue_usd = trade_amount_coins * entry_price
+                fee_usd = gross_revenue_usd * fee_rate
+                self.account_value += (gross_revenue_usd - fee_usd)
+                
+                # Setup inverted short targets (Loss is up, Profit is down)
+                stop_loss_price = round(entry_price * (1 + risk_percent * 1), 2)
+                take_profit_price = round(entry_price * (1 - risk_percent * risk_ratio), 2)
+                print(f"\t[INFO: Open Short] Shorted {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
+            
+            # Place limits on the trade
+            print(f"\t[INFO: Set Targets] Stop Loss at ${stop_loss_price:.2f}, Take Profit at ${take_profit_price:.2f}.")
+            self.place_take_and_stop(stop_loss_price, take_profit_price, trade_id="simulated_trade_id", action='paper')
+
+        # Allows closing trades
+        elif action.split("_")[0] == "SELL" and action in ["SELL_LONG", "SELL_SHORT"]:
+            coins_to_close = amount 
+            
+            if action == "SELL_LONG":
+                # Selling your long position instantly hits the BID
+                exit_price = curr_bid
+                gross_return_usd = coins_to_close * exit_price
+                fee_usd = gross_return_usd * fee_rate
+                
+                # Cash flows back into your wallet minus the transaction fee
+                self.account_value += (gross_return_usd - fee_usd)
+                print(f"\t[INFO: Close Long] Sold {coins_to_close} {ticker} at Bid ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
+                
+            elif action == "SELL_SHORT":
+                # Closing a short means buying back the debt instantly at the ASK
+                exit_price = curr_ask
+                gross_buyback_cost = coins_to_close * exit_price
+                fee_usd = gross_buyback_cost * fee_rate
+                
+                # Cash is stripped from your wallet to pay for the buyback + fee
+                self.account_value -= (gross_buyback_cost + fee_usd)
+                print(f"\t[INFO: Close Short] Covered {coins_to_close} {ticker} at Ask ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
+        
+        else:
+            raise ValueError("Invalid action specified for paper trading")
+        
+        
+    def place_take_and_stop(self, stop_loss_price, take_profit_price, trade_id, action):
+        # Place take profit and stop loss orders based on entry price and desired risk/reward
+        if action == 'live':
+            pass 
+        
+        elif action == 'paper':
+            self.paper_trade_targets[trade_id] = {
+                "stop_loss": stop_loss_price,
+                "take_profit": take_profit_price
+            }
+            # We would now need to monitor and do the sale here while keeping data acquisition alive
         
         
     def results_for_day(self):

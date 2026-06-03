@@ -1,56 +1,100 @@
 import asyncio
 import json
+import requests
 import websockets
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from utils import KrakenUtils
 
 class KrakenScraper():
-    def __init__(self, ticker, api_key=None, api_secret=None, stream_type="ticker"):
+    def __init__(self, ticker, api_key=None, api_secret=None, stream_type="ohlc"):
         self.ticker = ticker  
-        self.api_key = api_key
-        self.api_secret = api_secret
+        self.data_api_key = api_key
+        self.data_api_secret = api_secret
         self.stream_type = stream_type
+        
+        self.base_url = "https://api.kraken.com"
+        
+        # For processing bars and trades
+        self.on_bar = None
+        self.on_trade = None
+        
+        self.latest_ask = 0.0
+        self.latest_bid = 0.0
 
-    async def stream(self, interval_amt=1):
+
+    def get_current_price(self, ticker):
+        if self.latest_ask > 0 and self.latest_bid > 0:
+            return self.latest_ask, self.latest_bid
+            
+        try:
+            url_path = "/0/public/Ticker"  
+            params = {"pair": ticker}
+            response = requests.get(url=self.base_url + url_path, params=params)
+            data = response.json()
+            ticker_key = list(data["result"].keys())[0]
+            self.latest_ask = float(data["result"][ticker_key]["a"][0])
+            self.latest_bid = float(data["result"][ticker_key]["b"][0])
+            return self.latest_ask, self.latest_bid
+        except Exception as e:
+            print(f"Ticker REST fallback error: {e}")
+            return 0.0, 0.0
+
+
+    async def stream(self, intervals=[1, 5, 240]):
         url = "wss://ws.kraken.com/v2"
 
         async for websocket in websockets.connect(url):
             try:
-                sub_params = {
-                    "channel": self.stream_type, 
-                    "symbol": [self.ticker]
-                }
+                print(f"Connected to Kraken. Subscribing to channels...")
+
+                for interval in intervals:
+                    subscribe_ohlc = {
+                        "method": "subscribe",
+                        "params": {
+                            "channel": "ohlc", 
+                            "symbol": [self.ticker],
+                            "interval": interval
+                        }
+                    }
+                    await websocket.send(json.dumps(subscribe_ohlc))
                 
-                if self.stream_type == "book":
-                    sub_params["depth"] = 10
-                elif self.stream_type == "ohlc":
-                    sub_params["interval"] = interval_amt
-
-                subscribe_msg = {
+                subscribe_trade = {
                     "method": "subscribe",
-                    "params": sub_params
+                    "params": {
+                        "channel": "trade",
+                        "symbol": [self.ticker]
+                    }
                 }
-
-                await websocket.send(json.dumps(subscribe_msg))
+                await websocket.send(json.dumps(subscribe_trade))
 
                 async for message in websocket:
                     data = json.loads(message)
                     
-                    # Kraken sends an 'ack' and 'heartbeats' which don't have a 'data' key
-                    # This check prevents your code from crashing on those messages
                     if "data" in data:
-                        print(f"--- New {self.stream_type} Update ---")
-                        print(json.dumps(data["data"], indent=2))
-                    else:  # Can ignore, but may want to keep for logging and making sure setup works
-                        print(f"System Message: {data.get('method') or data.get('channel')}")
+                        channel = data.get("channel")
+                        
+                        if channel == "ohlc":
+                            streamed_interval = data.get("params", {}).get("interval")
+                            for candle in data["data"]:
+                                self.latest_ask = float(candle.get("close", self.latest_ask))
+                                self.latest_bid = float(candle.get("close", self.latest_bid))
+                                
+                                if self.on_bar:
+                                    self.on_bar(candle, streamed_interval)
+
+                        elif channel == "trade":
+                            for tick in data["data"]:
+                                tick_price = float(tick["price"])
+                                self.latest_ask = tick_price
+                                self.latest_bid = tick_price
+                                
+                                if self.on_trade:
+                                    self.on_trade(tick)
 
             except websockets.ConnectionClosed:
-                print("Connection closed, retrying...")
+                print("Connection lost! Re-establishing connection in 5 seconds...")
+                await asyncio.sleep(5)
                 continue
-
-if __name__ == "__main__":
-    scraper = KrakenScraper(ticker="BTC/USD", stream_type="ohlc")  # "ticker", "book", "trade", or "ohlc"
-    # Note: ohlc will update the candle on each trade, need to update the row in data
-
-    try:
-        asyncio.run(scraper.stream())
-    except KeyboardInterrupt:
-        print("\nStream stopped by user.")
