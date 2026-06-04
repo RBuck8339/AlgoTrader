@@ -303,7 +303,7 @@ class BaseTrader(ABC):
         raise NotImplementedError("Subclasses must implement check_signals method for their strategy")
     
     
-    def main(self, methods_to_run=[], setting='paper'):
+    async def main(self, methods_to_run=[], setting='paper', num_votes=None, intervals=[1, 5, 240]):
         """
         Main function to run trader
         Capabilities:
@@ -317,13 +317,53 @@ class BaseTrader(ABC):
             setting: 'paper' or 'live'
         """
         
+        # Just in case, should never happen tho
+        if len(methods_to_run) == 0:
+            raise ValueError("At least one method must be provided to run the trader.")
+        
+        if num_votes == None:
+            num_votes = len(methods_to_run)  # Default to unanimous vote if not specified
+        
+        # Start streaming data in background
+        asyncio.create_task(self.scraper.stream(intervals=intervals))
+        
+        print(f"[INFO] Data streaming started for intervals: {intervals}")
+        print(f"[INFO] Trader started in {setting} mode with {len(methods_to_run)} methods")
+        
+        # optionally, can run this on a timer (say every minute for minute candles)
         while True:
+            interval_posted = await self.bar_queue.get() 
+            
             signals = []  # In case we do voting later, this will allow counting how many methods are signaling the same thing
             for method in methods_to_run:
                 signals.append(method.check_signals())
                 
+            # Vote buy
+            if (not self.holding) and signals.count(1) >= num_votes:
+                self.order_placer(
+                    amount=0,
+                    ticker=self.ticker,
+                    action="BUY_LONG" if self.position_type == "LONG" else "BUY_SHORT",
+                    risk_percent=0.02,
+                    risk_ratio=2.0
+                )
+            
+            # Vote sell
+            elif self.holding and signals.count(-1) >= num_votes:
+                self.order_placer(
+                    amount=0,
+                    ticker=self.ticker,
+                    action="SELL_LONG" if self.position_type == "LONG" else "SELL_SHORT",
+                    risk_percent=0.02,
+                    risk_ratio=2.0
+                )
                 
-    def setup(self, methods):
+            # Take profit and stop losses should automatically be monitored by kraken, so we don't account for it here
+                
+            self.bar_queue.task_done()
+                
+                
+    def setup(self, methods, setting='paper'):
         """
         params:
             methods: List of (method, param dict) tuples to run for setup
@@ -334,4 +374,5 @@ class BaseTrader(ABC):
         for method, params in methods:
             initialized_methods.append(method(**params))
             
-        self.main(methods_to_run=initialized_methods, setting='paper')
+        self.order_placer = self.place_order_paper if setting == 'paper' else self.place_order_live
+        self.main(methods_to_run=initialized_methods, setting=setting)
