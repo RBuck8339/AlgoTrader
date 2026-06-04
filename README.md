@@ -1,13 +1,8 @@
 # AlgoTrader
+An Algorithmic Trader I am designing as a passion project. It will primarily focus on trading Cryptocurrencies through Kraken. Eventually, once the strategies prove profitable, I would like to move to stocks or other brokers to test other strategies with improved data.
+
+# Important Notes
+Infrastructure will be posted here, including backtesting, data visualization, results, strategy structure. However, the actual strategies used will not be added to the repo, feel free to reach out to me personally regarding information on execution.
 
 # Required Setup
-- Install requirements (requirements.txt coming soon)
-- Set up the following variables in `.env`:
-<pre>
-ALPACA_KEY
-ALPACA_SECRET
-USING_PAPER
-TRADE_START
-TRADE_END
-STOCKS - written as SYM,SYM,.... Example (MSFT,TSLA,...)
-</pre>
+COMING SOON
