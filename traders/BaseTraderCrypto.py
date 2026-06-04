@@ -1,5 +1,4 @@
 import asyncio
-
 import requests
 from dotenv import load_dotenv
 import os
@@ -11,13 +10,10 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from scrapers.stream.KrakenScraper import KrakenScraper
 import time 
 from collections import defaultdict
-
 import hashlib
 import hmac
 import base64
-
 from utils import KrakenUtils
-
 
 # ENV Variables
 load_dotenv()
@@ -53,8 +49,11 @@ class BaseTrader(ABC):
             stream_type="ohlc",
             api_secret=os.getenv("KRAKEN_DATA_KEY_PRIVATE"),
             api_key=os.getenv("KRAKEN_DATA_KEY_PUBLIC"),
-            # on_bar=self.on_new_bar
         )
+        
+        # Stream hooks linking scraper updates to BaseTrader
+        self.scraper.on_bar = self.on_new_bar
+        self.scraper.on_trade = self.on_new_trade
         
         # For API usage
         self.base_url = "https://api.kraken.com"
@@ -62,6 +61,10 @@ class BaseTrader(ABC):
         self.data_api_key = os.getenv("KRAKEN_DATA_KEY_PUBLIC")
         self.starting_account_value = None
         self.account_value = None
+        
+        execution_mode = "paper"  # Change to "live" when ready to go live
+
+        self.paper_trade_targets = {}  # trade_id: {"stop_loss": price, "take_profit": price}  (Used to simulate take profit and stop loss)
 
 
     def on_new_bar(self, candle, interval):
@@ -80,8 +83,6 @@ class BaseTrader(ABC):
             if len(self.ohlc_history[interval]) > 200:
                 self.ohlc_history[interval].pop(0)
             
-            # 📬 PUSH TO QUEUE: Tell the main thread a new bar is officially ready!
-            # loop.call_soon_threadsafe is used if your scraper runs on a separate thread
             asyncio.run_coroutine_threadsafe(
                 self.bar_queue.put(interval), 
                 asyncio.get_event_loop()
@@ -90,19 +91,26 @@ class BaseTrader(ABC):
         elif last_ts is None:
             self.last_closed_timestamps[interval] = current_ts
             self.ohlc_history[interval].append(candle)
-            
-            
+
+
+    def on_new_trade(self, trade_data):
+        """Callback for when a new trade is received from the data stream."""
+        if self.execution_mode == "paper":
+            self.monitor_paper_exits(current_candle=None, ticker=self.ticker)
+        
+
+
     def get_dataframe(self, interval):
-        """Helper to instantly generate an analytical dataframe."""
+        """Helper to instantly generate a dataframe. Saves memory"""
         df = pd.DataFrame(self.ohlc_history[interval])
         for col in ["open", "high", "low", "close", "volume"]:
             if col in df.columns:
                 df[col] = df[col].astype(float)
         return df
-            
+
 
     def get_account_value(self):
-        url_path = "/0/private/TradeBalance"  # Can probably just make this a param for a multi-function function
+        url_path = "/0/private/TradeBalance"
         
         # Setup
         nonce = int(time.time() * 1000)
@@ -123,97 +131,13 @@ class BaseTrader(ABC):
         self.account_value = data["result"]["eb"]
         
         return self.account_value
-        
-        
-    def verify_account(self):
-        # TODO Verify connection to account (Can also be done through get_account_value tbh)
-        pass
-    
-    
+
+
     def place_order_live(self, amount: float, ticker: str, action: str, risk_percent=0.02, risk_ratio=2.0):
-        # Place a paper order, default is long order (optional short)
-        """
-        Since kraken doesn't offer paper trading, we just simulate here
-        """
-        curr_ask, curr_bid = self.scraper.get_current_price(ticker)
-        
-        fee_rate = FEE_RATE # Fee is applied on both buy and sell
-        
-        # To open a position
-        if action.split("_")[0] == "BUY" and action in ["BUY_LONG", "BUY_SHORT"]:
-            # Set entry prices based on book spread and figure out how many coins to buy
-            entry_price = curr_ask if action == "BUY_LONG" else curr_bid
-            trade_amount_coins = round(amount / entry_price, 6)
-            
-            # Guard rail check against Kraken volume minimum constraints
-            if trade_amount_coins < MIN_PURCHASE_AMOUNT.get(ticker, 0):
-                print(f"\t[DEBUG: Order Rejected] {trade_amount_coins} coins is below minimum required for {ticker}.")
-                return
-            
-            stop_loss_price = 0
-            take_profit_price = 0
-        
-            if action == "BUY_LONG":
-                # Entry costs your wallet cash + the taker fee
-                total_cost_usd = (trade_amount_coins * entry_price) * (1 + fee_rate)
-                self.account_value -= total_cost_usd 
-                
-                # Setup standard long targets
-                stop_loss_price = round(entry_price * (1 -risk_percent * 1), 2)
-                take_profit_price = round(entry_price * (1 + risk_percent * risk_ratio), 2)
-                print(f"\t[INFO: Open Long] Bought {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
+        # TODO Implement live order execution endpoints
+        pass
 
-                # TODO API CALL HERE
-                
-            elif action == "BUY_SHORT":
-                # Shorting adds the sold coin revenue to your wallet, minus the fee
-                gross_revenue_usd = trade_amount_coins * entry_price
-                fee_usd = gross_revenue_usd * fee_rate
-                self.account_value += (gross_revenue_usd - fee_usd)
-                
-                # Setup inverted short targets (Loss is up, Profit is down)
-                stop_loss_price = round(entry_price * (1 + risk_percent * 1), 2)
-                take_profit_price = round(entry_price * (1 - risk_percent * risk_ratio), 2)
-                print(f"\t[INFO: Open Short] Shorted {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
-            
-                # TODO API CALL HERE
-            
-            # Place limits on the trade
-            print(f"\t[INFO: Set Targets] Stop Loss at ${stop_loss_price:.2f}, Take Profit at ${take_profit_price:.2f}.")
-            self.place_take_and_stop(stop_loss_price, take_profit_price, trade_id="simulated_trade_id", action='paper')
 
-        # Allows closing trades
-        elif action.split("_")[0] == "SELL" and action in ["SELL_LONG", "SELL_SHORT"]:
-            coins_to_close = amount 
-            
-            if action == "SELL_LONG":
-                # Selling your long position instantly hits the BID
-                exit_price = curr_bid
-                gross_return_usd = coins_to_close * exit_price
-                fee_usd = gross_return_usd * fee_rate
-                
-                # Cash flows back into your wallet minus the transaction fee
-                self.account_value += (gross_return_usd - fee_usd)
-                print(f"\t[INFO: Close Long] Sold {coins_to_close} {ticker} at Bid ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
-                
-                # TODO API CALL HERE
-                
-            elif action == "SELL_SHORT":
-                # Closing a short means buying back the debt instantly at the ASK
-                exit_price = curr_ask
-                gross_buyback_cost = coins_to_close * exit_price
-                fee_usd = gross_buyback_cost * fee_rate
-                
-                # Cash is stripped from your wallet to pay for the buyback + fee
-                self.account_value -= (gross_buyback_cost + fee_usd)
-                print(f"\t[INFO: Close Short] Covered {coins_to_close} {ticker} at Ask ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
-        
-                # TODO API CALL HERE
-        
-        else:
-            raise ValueError("Invalid action specified for live trading")
-    
-    
     def place_order_paper(self, amount: float, ticker: str, action: str, risk_percent=0.02, risk_ratio=2.0):
         # Place a paper order, default is long order (optional short)
         """
@@ -243,7 +167,7 @@ class BaseTrader(ABC):
                 self.account_value -= total_cost_usd 
                 
                 # Setup standard long targets
-                stop_loss_price = round(entry_price * (1 -risk_percent * 1), 2)
+                stop_loss_price = round(entry_price * (1 - risk_percent * 1), 2)
                 take_profit_price = round(entry_price * (1 + risk_percent * risk_ratio), 2)
                 print(f"\t[INFO: Open Long] Bought {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
 
@@ -260,7 +184,16 @@ class BaseTrader(ABC):
             
             # Place limits on the trade
             print(f"\t[INFO: Set Targets] Stop Loss at ${stop_loss_price:.2f}, Take Profit at ${take_profit_price:.2f}.")
-            self.place_take_and_stop(stop_loss_price, take_profit_price, trade_id="simulated_trade_id", action='paper')
+            
+            position_type = "LONG" if action == "BUY_LONG" else "SHORT"
+            self.place_take_and_stop(
+                stop_loss_price=stop_loss_price, 
+                take_profit_price=take_profit_price, 
+                trade_id="simulated_trade_id", 
+                action='paper',
+                position_type=position_type,
+                volume=trade_amount_coins
+            )
 
         # Allows closing trades
         elif action.split("_")[0] == "SELL" and action in ["SELL_LONG", "SELL_SHORT"]:
@@ -288,27 +221,70 @@ class BaseTrader(ABC):
         
         else:
             raise ValueError("Invalid action specified for paper trading")
-        
-        
-    def place_take_and_stop(self, stop_loss_price, take_profit_price, trade_id, action):
+
+
+    def place_take_and_stop(self, stop_loss_price, take_profit_price, trade_id, action, position_type=None, volume=0.0, interval_to_monitor=1):
         # Place take profit and stop loss orders based on entry price and desired risk/reward
         if action == 'live':
             pass 
         
         elif action == 'paper':
-            self.paper_trade_targets[trade_id] = {
+            self.paper_trade_targets = {
                 "stop_loss": stop_loss_price,
-                "take_profit": take_profit_price
+                "take_profit": take_profit_price,
+                "position_type": position_type,  # "LONG" or "SHORT"
+                "volume": volume,                # Total coins held in the trade
+                "active": True
             }
-            # We would now need to monitor and do the sale here while keeping data acquisition alive
+
+
+    def monitor_paper_exits(self, ticker, current_candle=None):
+        """
+        Monitors the active trade against real-time book prices on every incoming tick.
+        """
+        # If there are no open paper trades recorded, skip processing
+        if not hasattr(self, 'paper_trade_targets') or not self.paper_trade_targets.get("active"):
+            return
+            
+        curr_ask, curr_bid = self.scraper.get_current_price(ticker)
         
+        targets = self.paper_trade_targets
+        pos_type = targets["position_type"]
+        coins = targets["volume"]
+        sl = targets["stop_loss"]
+        tp = targets["take_profit"]
         
+        # Long Position
+        if pos_type == "LONG":
+            if curr_bid <= sl:
+                print(f"\n[Stop Loss] Long Bid ${curr_bid:.2f} dropped below SL ${sl:.2f}")
+                targets["active"] = False # Stop monitoring before running execution
+                self.place_order_paper(amount=coins, ticker=ticker, action="SELL_LONG")
+                
+            elif curr_bid >= tp:
+                print(f"\t[Take Profit] Long Bid ${curr_bid:.2f} hit target TP ${tp:.2f}")
+                targets["active"] = False
+                self.place_order_paper(amount=coins, ticker=ticker, action="SELL_LONG")
+                
+        # Short Position
+        elif pos_type == "SHORT":
+            if curr_ask >= sl:
+                print(f"\t[Stop Loss] Short Ask ${curr_ask:.2f} pumped above SL ${sl:.2f}")
+                targets["active"] = False
+                self.place_order_paper(amount=coins, ticker=ticker, action="SELL_SHORT")
+                
+            elif curr_ask <= tp:
+                print(f"\t[INFO: Take Profit] Short Ask ${curr_ask:.2f} hit target TP ${tp:.2f}")
+                targets["active"] = False
+                self.place_order_paper(amount=coins, ticker=ticker, action="SELL_SHORT")
+
+
     def results_for_day(self):
         """
         Get the results for the day; optionally send to a csv/database
         """
         pass 
-    
+
 
     def shutdown(self):
         """ 
@@ -318,6 +294,44 @@ class BaseTrader(ABC):
         # Need to stop data stream safely
         pass
 
-    
-    async def main(self):
+
+    @abstractmethod
+    def check_signals(self):
+        """
+        Abstract method to check for trading signals based on strategy
+        """
         raise NotImplementedError("Subclasses must implement check_signals method for their strategy")
+    
+    
+    def main(self, methods_to_run=[], setting='paper'):
+        """
+        Main function to run trader
+        Capabilities:
+            - Start Streaming Data
+            - Check for signals from n methods
+            - Place orders when ALL signals align
+            - Return data for the day at the end of each day
+        
+        params:
+            methods_to_run: List of (method)
+            setting: 'paper' or 'live'
+        """
+        
+        while True:
+            signals = []  # In case we do voting later, this will allow counting how many methods are signaling the same thing
+            for method in methods_to_run:
+                signals.append(method.check_signals())
+                
+                
+    def setup(self, methods):
+        """
+        params:
+            methods: List of (method, param dict) tuples to run for setup
+        """
+        
+        # Init each method
+        initialized_methods = []
+        for method, params in methods:
+            initialized_methods.append(method(**params))
+            
+        self.main(methods_to_run=initialized_methods, setting='paper')
