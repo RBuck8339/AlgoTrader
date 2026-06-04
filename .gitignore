@@ -431,3 +431,4 @@ backtesting/data/*
 traders/NN_Traders/*
 traders/RL_Traders/*
 traders/TA_Traders/*
+traders/Scalpers/*
