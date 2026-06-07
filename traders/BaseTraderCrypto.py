@@ -4,16 +4,14 @@ from dotenv import load_dotenv
 import os
 import pandas as pd
 from abc import ABC, abstractmethod
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-from scrapers.stream.KrakenScraper import KrakenScraper
 import time 
 from collections import defaultdict
-import hashlib
-import hmac
-import base64
-from utils import KrakenUtils
+
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from scrapers.stream.KrakenScraper import KrakenScraper
+from utils.KrakenUtils import KrakenUtils
 
 # ENV Variables
 load_dotenv()
@@ -62,7 +60,9 @@ class BaseTrader(ABC):
         self.starting_account_value = None
         self.account_value = None
         
-        execution_mode = "paper"  # Change to "live" when ready to go live
+        # Execution variables
+        self.execution_mode = "paper"  # Change to "live" when ready to go live
+        self.holding = False
 
         self.paper_trade_targets = {}  # trade_id: {"stop_loss": price, "take_profit": price}  (Used to simulate take profit and stop loss)
 
@@ -112,7 +112,7 @@ class BaseTrader(ABC):
     def get_account_value(self):
         url_path = "/0/private/TradeBalance"
         
-        # Setup
+        # Setup (TODO might make htis a function to just return signature with the nonce)
         nonce = int(time.time() * 1000)
         payload = {
             "nonce": nonce, 
@@ -134,8 +134,105 @@ class BaseTrader(ABC):
 
 
     def place_order_live(self, amount: float, ticker: str, action: str, risk_percent=0.02, risk_ratio=2.0):
-        # TODO Implement live order execution endpoints
-        pass
+        """
+        Live order placing through kraken (TODO NEEDS TESTING)
+        """
+        curr_ask, curr_bid = self.scraper.get_current_price(ticker)
+        
+        fee_rate = FEE_RATE # Fee is applied on both buy and sell
+        
+        url_path = "/0/private/AddOrder"
+        
+        # Setup (TODO might make htis a function to just return signature with the nonce)
+        nonce = int(time.time() * 1000)
+        payload = {
+            "nonce": nonce, 
+            "asset": "ZUSD"
+        }
+        signature = KrakenUtils.get_kraken_signature(url_path, payload, self.data_api_secret)
+        headers = {
+            "API-Key": self.data_api_key,
+            "API-Sign": signature,
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        response = requests.post(url=self.base_url + url_path, headers=headers, data=payload)
+        data = response.json()
+        
+        # To open a position
+        if action.split("_")[0] == "BUY" and action in ["BUY_LONG", "BUY_SHORT"]:
+            # Set entry prices based on book spread and figure out how many coins to buy
+            entry_price = curr_ask if action == "BUY_LONG" else curr_bid
+            trade_amount_coins = round(amount / entry_price, 6)
+            
+            # Guard rail check against Kraken volume minimum constraints
+            if trade_amount_coins < MIN_PURCHASE_AMOUNT.get(ticker, 0):
+                print(f"\t[DEBUG: Order Rejected] {trade_amount_coins} coins is below minimum required for {ticker}.")
+                return
+            
+            stop_loss_price = 0
+            take_profit_price = 0
+        
+            if action == "BUY_LONG":
+                # Entry costs your wallet cash + the taker fee
+                total_cost_usd = (trade_amount_coins * entry_price) * (1 + fee_rate)
+                self.account_value -= total_cost_usd 
+                
+                # Setup standard long targets
+                stop_loss_price = round(entry_price * (1 - risk_percent * 1), 2)
+                take_profit_price = round(entry_price * (1 + risk_percent * risk_ratio), 2)
+                print(f"\t[INFO: Open Long] Bought {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
+
+            elif action == "BUY_SHORT":
+                # Shorting adds the sold coin revenue to your wallet, minus the fee
+                gross_revenue_usd = trade_amount_coins * entry_price
+                fee_usd = gross_revenue_usd * fee_rate
+                self.account_value += (gross_revenue_usd - fee_usd)
+                
+                # Setup inverted short targets (Loss is up, Profit is down)
+                stop_loss_price = round(entry_price * (1 + risk_percent * 1), 2)
+                take_profit_price = round(entry_price * (1 - risk_percent * risk_ratio), 2)
+                print(f"\t[INFO: Open Short] Shorted {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
+            
+            # Place limits on the trade
+            print(f"\t[INFO: Set Targets] Stop Loss at ${stop_loss_price:.2f}, Take Profit at ${take_profit_price:.2f}.")
+            
+            position_type = "LONG" if action == "BUY_LONG" else "SHORT"
+            self.place_take_and_stop(
+                stop_loss_price=stop_loss_price, 
+                take_profit_price=take_profit_price, 
+                trade_id="simulated_trade_id", 
+                action='paper',
+                position_type=position_type,
+                volume=trade_amount_coins
+            )
+
+        # Allows closing trades
+        elif action.split("_")[0] == "SELL" and action in ["SELL_LONG", "SELL_SHORT"]:
+            coins_to_close = self.paper_trade_targets["volume"]
+            
+            if action == "SELL_LONG":
+                # Selling your long position instantly hits the BID
+                exit_price = curr_bid
+                gross_return_usd = coins_to_close * exit_price
+                fee_usd = gross_return_usd * fee_rate
+                
+                # Cash flows back into your wallet minus the transaction fee
+                self.account_value += (gross_return_usd - fee_usd)
+                print(f"\t[INFO: Close Long] Sold {coins_to_close} {ticker} at Bid ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
+                
+            elif action == "SELL_SHORT":
+                # Closing a short means buying back the debt instantly at the ASK
+                exit_price = curr_ask
+                gross_buyback_cost = coins_to_close * exit_price
+                fee_usd = gross_buyback_cost * fee_rate
+                
+                # Cash is stripped from your wallet to pay for the buyback + fee
+                self.account_value -= (gross_buyback_cost + fee_usd)
+                print(f"\t[INFO: Close Short] Covered {coins_to_close} {ticker} at Ask ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
+        
+        else:
+            raise ValueError("Invalid action specified for paper trading")
 
 
     def place_order_paper(self, amount: float, ticker: str, action: str, risk_percent=0.02, risk_ratio=2.0):
@@ -197,7 +294,7 @@ class BaseTrader(ABC):
 
         # Allows closing trades
         elif action.split("_")[0] == "SELL" and action in ["SELL_LONG", "SELL_SHORT"]:
-            coins_to_close = amount 
+            coins_to_close = self.paper_trade_targets["volume"]
             
             if action == "SELL_LONG":
                 # Selling your long position instantly hits the BID
@@ -296,74 +393,122 @@ class BaseTrader(ABC):
 
 
     @abstractmethod
-    def check_signals(self):
+    def check_signals(self, dfs, interval_posted):
         """
         Abstract method to check for trading signals based on strategy
         """
-        raise NotImplementedError("Subclasses must implement check_signals method for their strategy")
+        raise NotImplementedError("Subclasses must implement check_signals(dfs, interval_posted) method for their strategy")
     
     
+    # NOTE Retrying with REST
     async def main(self, methods_to_run=[], setting='paper', num_votes=None, intervals=[1, 5, 240]):
-        """
-        Main function to run trader
-        Capabilities:
-            - Start Streaming Data
-            - Check for signals from n methods
-            - Place orders when ALL signals align
-            - Return data for the day at the end of each day
-        
-        params:
-            methods_to_run: List of (method)
-            setting: 'paper' or 'live'
-        """
-        
-        # Just in case, should never happen tho
         if len(methods_to_run) == 0:
-            raise ValueError("At least one method must be provided to run the trader.")
+            raise ValueError("[ERROR] At least one method must be provided to run the trader.")
+        if num_votes is None:
+            num_votes = len(methods_to_run)
+
+        print(f"[INFO] REST Polling Engine activated for intervals: {intervals}")
+        url_path = "/0/public/OHLC"
         
-        if num_votes == None:
-            num_votes = len(methods_to_run)  # Default to unanimous vote if not specified
+        # Track last processed timestamps per interval to guarantee no duplicate rows (could do df.drop_duplicates later if needed)
+        self.last_processed_timestamps = {interval: None for interval in intervals}
         
-        # Start streaming data in background
-        asyncio.create_task(self.scraper.stream(intervals=intervals))
+        all_dfs = {}  # Dfs for each interval
         
-        print(f"[INFO] Data streaming started for intervals: {intervals}")
-        print(f"[INFO] Trader started in {setting} mode with {len(methods_to_run)} methods")
-        
-        # optionally, can run this on a timer (say every minute for minute candles)
+        print("[INFO INIT] Getting base historical data for active intervals")
+        for interval in intervals:
+            try:
+                params = {"pair": self.ticker, "interval": interval}
+                response = requests.get(self.base_url + url_path, params=params)
+                data = response.json()
+                ticker_key = list(data["result"].keys())[0]
+                df = pd.DataFrame(data["result"][ticker_key], columns=[
+                    "timestamp", "open", "high", "low", "close", "vwap", "volume", "count"
+                ])
+                closed_df = df.iloc[:-1].copy()
+                for col in ["open", "high", "low", "close", "volume"]:
+                    closed_df[col] = closed_df[col].astype(float)
+                
+                all_dfs[interval] = closed_df
+                self.last_processed_timestamps[interval] = int(closed_df.iloc[-1]["timestamp"])
+                print(f"[INFO] Baseline loaded for {interval}m cache.")
+            except Exception as e:
+                print(f"[ERROR] Failed to seed initial baseline for {interval}m: {e}")
+
         while True:
-            interval_posted = await self.bar_queue.get() 
+            await asyncio.sleep(60 - (time.time() % 60))  # Wake up processing each minute to collect the candle
             
-            signals = []  # In case we do voting later, this will allow counting how many methods are signaling the same thing
-            for method in methods_to_run:
-                signals.append(method.check_signals())
-                
-            # Vote buy
-            if (not self.holding) and signals.count(1) >= num_votes:
-                self.order_placer(
-                    amount=0,
-                    ticker=self.ticker,
-                    action="BUY_LONG" if self.position_type == "LONG" else "BUY_SHORT",
-                    risk_percent=0.02,
-                    risk_ratio=2.0
-                )
+            current_minute = int(time.time() // 60)
             
-            # Vote sell
-            elif self.holding and signals.count(-1) >= num_votes:
-                self.order_placer(
-                    amount=0,
-                    ticker=self.ticker,
-                    action="SELL_LONG" if self.position_type == "LONG" else "SELL_SHORT",
-                    risk_percent=0.02,
-                    risk_ratio=2.0
-                )
+            intervals_processed_this_loop = []
+
+            print("[DEBUG] Attempting to grab data")
+
+            # Poll REST for each interval
+            for interval in intervals:
+                if current_minute % interval != 0:
+                    continue
+
+                try:
+                    params = {"pair": self.ticker, "interval": interval}
+                    response = requests.get(self.base_url + url_path, params=params)
+                    data = response.json()
+                    
+                    if "error" in data and data["error"]:
+                        print(f"[ERROR (NONFATAL)] Kraken API Error for {interval}m: {data['error']}")
+                        continue
+                        
+                    ticker_key = list(data["result"].keys())[0]
+                    raw_candles = data["result"][ticker_key]
+
+                    df = pd.DataFrame(raw_candles, columns=[
+                        "timestamp", "open", "high", "low", "close", "vwap", "volume", "count"
+                    ])
+                    
+                    closed_df = df.iloc[:-1].copy()  # Last row is an unclosed candle
+                    
+                    if closed_df.empty:
+                        continue
+                        
+                    latest_closed_ts = int(closed_df.iloc[-1]["timestamp"])
+                    
+                    # Verify is new candle
+                    if self.last_processed_timestamps[interval] == latest_closed_ts:
+                        continue
+                    
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        closed_df[col] = closed_df[col].astype(float)
+
+                    # Update memory
+                    all_dfs[interval] = closed_df
+                    self.last_processed_timestamps[interval] = latest_closed_ts
+                    intervals_processed_this_loop.append(interval)
+                    
+                    print(f"[DEBUG] Processed interval: {interval}")
+
+                except Exception as e:
+                    print(f"[ERROR] REST Data Pull Error for {interval}m interval: {e}")
+
+            # Check signals for all methods
+            if intervals_processed_this_loop:
+                interval_to_process = max(intervals_processed_this_loop)  # Strategies will typically depend on higher candles first
                 
-            # Take profit and stop losses should automatically be monitored by kraken, so we don't account for it here
+                if all(i in all_dfs for i in intervals):
+                    print(f"[DEBUG] Checking signals for up to {interval_to_process}m candles")
+                    signals = []
+                    for method in methods_to_run:
+                        signals.append(method.check_signals(dfs=all_dfs, interval_posted=interval_to_process))
+
+                    # Vote buy
+                    if not self.holding:
+                        trade_budget_usd = self.account_value * 0.10 if self.account_value else 1000.0
+                        if signals.count("BUY_LONG") >= num_votes:
+                            self.order_placer(amount=trade_budget_usd, ticker=self.ticker, action="BUY_LONG")
+                        elif signals.count("BUY_SHORT") >= num_votes:
+                            self.order_placer(amount=trade_budget_usd, ticker=self.ticker, action="BUY_SHORT")
                 
-            self.bar_queue.task_done()
                 
-                
-    def setup(self, methods, setting='paper'):
+    def setup_trading(self, methods, setting='paper'):
         """
         params:
             methods: List of (method, param dict) tuples to run for setup
@@ -375,4 +520,4 @@ class BaseTrader(ABC):
             initialized_methods.append(method(**params))
             
         self.order_placer = self.place_order_paper if setting == 'paper' else self.place_order_live
-        self.main(methods_to_run=initialized_methods, setting=setting)
+        asyncio.run(self.main(methods_to_run=initialized_methods, setting=setting))
