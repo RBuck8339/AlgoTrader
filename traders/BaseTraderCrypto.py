@@ -135,104 +135,150 @@ class BaseTrader(ABC):
 
     def place_order_live(self, amount: float, ticker: str, action: str, risk_percent=0.02, risk_ratio=2.0):
         """
-        Live order placing through kraken (TODO NEEDS TESTING)
+        Executes a primary market order, captures the execution metrics,
+        and instantly deploys an independent, server-side OCO exit bracket.
+        Cancels any open OCO bracket if a manual sell/close is triggered early.
         """
         curr_ask, curr_bid = self.scraper.get_current_price(ticker)
-        
-        fee_rate = FEE_RATE # Fee is applied on both buy and sell
-        
+        fee_rate = FEE_RATE 
         url_path = "/0/private/AddOrder"
         
-        # Setup (TODO might make htis a function to just return signature with the nonce)
-        nonce = int(time.time() * 1000)
-        payload = {
-            "nonce": nonce, 
-            "asset": "ZUSD"
-        }
-        signature = KrakenUtils.get_kraken_signature(url_path, payload, self.data_api_secret)
-        headers = {
-            "API-Key": self.data_api_key,
-            "API-Sign": signature,
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        
-        response = requests.post(url=self.base_url + url_path, headers=headers, data=payload)
-        data = response.json()
-        
-        # To open a position
         if action.split("_")[0] == "BUY" and action in ["BUY_LONG", "BUY_SHORT"]:
-            # Set entry prices based on book spread and figure out how many coins to buy
             entry_price = curr_ask if action == "BUY_LONG" else curr_bid
             trade_amount_coins = round(amount / entry_price, 6)
-            
-            # Guard rail check against Kraken volume minimum constraints
+
             if trade_amount_coins < MIN_PURCHASE_AMOUNT.get(ticker, 0):
-                print(f"\t[DEBUG: Order Rejected] {trade_amount_coins} coins is below minimum required for {ticker}.")
+                print(f"[DEBUG: Order Rejected] {trade_amount_coins} coins is below minimum required.")
                 return
+
+            order_type_side = "buy" if action == "BUY_LONG" else "sell"
             
-            stop_loss_price = 0
-            take_profit_price = 0
-        
+            entry_payload = {
+                "nonce": int(time.time() * 1000),
+                "ordertype": "market",
+                "type": order_type_side,
+                "volume": str(trade_amount_coins),
+                "pair": ticker.replace("/", "")
+            }
+            
+            if action == "BUY_SHORT":
+                entry_payload["leverage"] = "2"
+
+            # Route primary entry directly to matching engine
+            sig_entry = KrakenUtils.get_kraken_signature(url_path, entry_payload, self.data_api_secret)
+            headers_entry = {"API-Key": self.data_api_key, "API-Sign": sig_entry, "Content-Type": "application/x-www-form-urlencoded"}
+            
+            res_entry = requests.post(url=self.base_url + url_path, headers=headers_entry, data=entry_payload).json()
+            
+            if "error" in res_entry and res_entry["error"]:
+                print(f"[API ERROR] Primary order failed: {res_entry['error']}")
+                return
+
+            print(f"[INFO] Primary position filled on server. TxID: {res_entry['result']['txid'][0]}")
+
+            # Calculate exact upside/downside parameters based on your entry price metrics
             if action == "BUY_LONG":
-                # Entry costs your wallet cash + the taker fee
-                total_cost_usd = (trade_amount_coins * entry_price) * (1 + fee_rate)
-                self.account_value -= total_cost_usd 
-                
-                # Setup standard long targets
-                stop_loss_price = round(entry_price * (1 - risk_percent * 1), 2)
+                stop_loss_price = round(entry_price * (1 - risk_percent), 2)
                 take_profit_price = round(entry_price * (1 + risk_percent * risk_ratio), 2)
-                print(f"\t[INFO: Open Long] Bought {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
-
+                close_type_side = "sell"
             elif action == "BUY_SHORT":
-                # Shorting adds the sold coin revenue to your wallet, minus the fee
-                gross_revenue_usd = trade_amount_coins * entry_price
-                fee_usd = gross_revenue_usd * fee_rate
-                self.account_value += (gross_revenue_usd - fee_usd)
-                
-                # Setup inverted short targets (Loss is up, Profit is down)
-                stop_loss_price = round(entry_price * (1 + risk_percent * 1), 2)
+                stop_loss_price = round(entry_price * (1 + risk_percent), 2)
                 take_profit_price = round(entry_price * (1 - risk_percent * risk_ratio), 2)
-                print(f"\t[INFO: Open Short] Shorted {trade_amount_coins} {ticker} at ${entry_price:.2f}.")
-            
-            # Place limits on the trade
-            print(f"\t[INFO: Set Targets] Stop Loss at ${stop_loss_price:.2f}, Take Profit at ${take_profit_price:.2f}.")
-            
-            position_type = "LONG" if action == "BUY_LONG" else "SHORT"
-            self.place_take_and_stop(
-                stop_loss_price=stop_loss_price, 
-                take_profit_price=take_profit_price, 
-                trade_id="simulated_trade_id", 
-                action='paper',
-                position_type=position_type,
-                volume=trade_amount_coins
-            )
+                close_type_side = "buy"
 
-        # Allows closing trades
-        elif action.split("_")[0] == "SELL" and action in ["SELL_LONG", "SELL_SHORT"]:
-            coins_to_close = self.paper_trade_targets["volume"]
+            # Exploit Kraken's stop-loss-limit conversion logic to mirror standard brackets
+            oco_payload = {
+                "nonce": int(time.time() * 1000),
+                "ordertype": "stop-loss-limit", 
+                "type": close_type_side,
+                "volume": str(trade_amount_coins),
+                "pair": ticker.replace("/", ""),
+                "price": str(stop_loss_price),  # Target Stop Loss boundary line
+                "price2": str(take_profit_price)  # Target Take Profit boundary line
+            }
+
+            if action == "BUY_SHORT":
+                oco_payload["leverage"] = "2"
+
+            sig_oco = KrakenUtils.get_kraken_signature(url_path, oco_payload, self.data_api_secret)
+            headers_oco = {"API-Key": self.data_api_key, "API-Sign": sig_oco, "Content-Type": "application/x-www-form-urlencoded"}
             
+            res_oco = requests.post(url=self.base_url + url_path, headers=headers_oco, data=oco_payload).json()
+
+            if "error" in res_oco and res_oco["error"]:
+                print(f"[BRACKET WARNING] Position open, but server exit booking failed: {res_oco['error']}")
+                self.current_oco_txid = None
+            else:
+                oco_txid = res_oco['result']['txid'][0]
+                print(f"\t[INFO] Server-side OCO exit lines successfully mapped. TxID: {oco_txid}")
+                self.current_oco_txid = oco_txid # Store the exit bracket ID for later cancellation
+
+            # Keep localized portfolio account records accurate
+            if action == "BUY_LONG":
+                self.account_value -= (trade_amount_coins * entry_price) * (1 + fee_rate)
+            elif action == "BUY_SHORT":
+                self.account_value += (trade_amount_coins * entry_price) * (1 - fee_rate)
+
+            # Track our position
+            self.holding = True
+            self.position_type = "LONG" if action == "BUY_LONG" else "SHORT"
+            self.current_position_volume = trade_amount_coins
+
+        # Handle structural system clearings if strategies fire manual intervention early
+        elif action.split("_")[0] == "SELL" and action in ["SELL_LONG", "SELL_SHORT"]:
+            # Cancel current sell order that has stop-loss and take-profit
+            if hasattr(self, 'current_oco_txid') and self.current_oco_txid:
+                cancel_url_path = "/0/private/CancelOrder"
+                cancel_payload = {
+                    "nonce": int(time.time() * 1000),
+                    "txid": self.current_oco_txid
+                }
+                sig_cancel = KrakenUtils.get_kraken_signature(cancel_url_path, cancel_payload, self.data_api_secret)
+                headers_cancel = {"API-Key": self.data_api_key, "API-Sign": sig_cancel, "Content-Type": "application/x-www-form-urlencoded"}
+                
+                res_cancel = requests.post(url=self.base_url + cancel_url_path, headers=headers_cancel, data=cancel_payload).json()
+                
+                if "error" in res_cancel and res_cancel["error"]:
+                    print(f"[ERROR] Failed to cancel open OCO bracket {self.current_oco_txid}: {res_cancel['error']}")
+                else:
+                    print(f"[INFO] Successfully canceled open server OCO exit bracket: {self.current_oco_txid}")
+                
+                self.current_oco_txid = None
+
+            coins_to_close = getattr(self, "current_position_volume", 0.0)
+            if coins_to_close == 0.0:
+                print("[ERROR] Tried to close position, but current_position_volume is 0.")
+                return
+
+            order_type_side = "sell" if action == "SELL_LONG" else "buy"
+            
+            exit_payload = {
+                "nonce": int(time.time() * 1000),
+                "ordertype": "market",
+                "type": order_type_side,
+                "volume": str(coins_to_close),
+                "pair": ticker.replace("/", "")
+            }
+            if action == "SELL_SHORT":
+                exit_payload["leverage"] = "2"
+
+            sig_exit = KrakenUtils.get_kraken_signature(url_path, exit_payload, self.data_api_secret)
+            headers_exit = {"API-Key": self.data_api_key, "API-Sign": sig_exit, "Content-Type": "application/x-www-form-urlencoded"}
+            
+            requests.post(url=self.base_url + url_path, headers=headers_exit, data=exit_payload)
+
             if action == "SELL_LONG":
-                # Selling your long position instantly hits the BID
-                exit_price = curr_bid
-                gross_return_usd = coins_to_close * exit_price
-                fee_usd = gross_return_usd * fee_rate
-                
-                # Cash flows back into your wallet minus the transaction fee
-                self.account_value += (gross_return_usd - fee_usd)
-                print(f"\t[INFO: Close Long] Sold {coins_to_close} {ticker} at Bid ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
-                
+                self.account_value += (coins_to_close * curr_bid) * (1 - fee_rate)
             elif action == "SELL_SHORT":
-                # Closing a short means buying back the debt instantly at the ASK
-                exit_price = curr_ask
-                gross_buyback_cost = coins_to_close * exit_price
-                fee_usd = gross_buyback_cost * fee_rate
-                
-                # Cash is stripped from your wallet to pay for the buyback + fee
-                self.account_value -= (gross_buyback_cost + fee_usd)
-                print(f"\t[INFO: Close Short] Covered {coins_to_close} {ticker} at Ask ${exit_price:.2f}. Wallet: ${self.account_value:.2f}")
-        
-        else:
-            raise ValueError("Invalid action specified for paper trading")
+                self.account_value -= (coins_to_close * curr_ask) * (1 + fee_rate)
+
+            # Reset state variables
+            self.holding = False
+            self.position_type = None
+            self.current_position_volume = 0.0
+
+        curr_val = self.get_account_value()
+        print(f"[DEBUG] Placed order. Wallet Balance: ${curr_val}")
 
 
     def place_order_paper(self, amount: float, ticker: str, action: str, risk_percent=0.02, risk_ratio=2.0):
@@ -321,11 +367,7 @@ class BaseTrader(ABC):
 
 
     def place_take_and_stop(self, stop_loss_price, take_profit_price, trade_id, action, position_type=None, volume=0.0, interval_to_monitor=1):
-        # Place take profit and stop loss orders based on entry price and desired risk/reward
-        if action == 'live':
-            pass 
-        
-        elif action == 'paper':
+        if action == 'paper':
             self.paper_trade_targets = {
                 "stop_loss": stop_loss_price,
                 "take_profit": take_profit_price,
@@ -385,7 +427,7 @@ class BaseTrader(ABC):
 
     def shutdown(self):
         """ 
-        If we have lost too much money for the day, invoke this function and shutdown for the day
+        If we have lost too much money for the day, or just are done for now, invoke this function and shutdown for the day
         Log so that I can fix it
         """
         # Need to stop data stream safely
@@ -436,6 +478,8 @@ class BaseTrader(ABC):
                 print(f"[ERROR] Failed to seed initial baseline for {interval}m: {e}")
 
         while True:
+            # TODO at the start of each 24 hour window, set a failsafe amount of the portfolio where if we lose X% of account we shut down
+            
             await asyncio.sleep(60 - (time.time() % 60))  # Wake up processing each minute to collect the candle
             
             current_minute = int(time.time() // 60)
