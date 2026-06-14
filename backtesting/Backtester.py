@@ -1,14 +1,14 @@
 import os
 import sys
-from datetime import datetime 
+from datetime import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import pandas as pd
 
 from backtesting.CryptoHistoryGrabber import KrakenHistoricalScraper
-from traders.TA_Traders.MACrossover import SingleMACrossover
 from backtesting.Visualizer import Visualizer
+from traders.Scalpers.Breakout5mScalper import Breakout5mScalper
 
 INTERVAL_MAP = {
     1: "1m", 5: "5m", 15: "15m", 30: "30m", 60: "1h",
@@ -17,23 +17,19 @@ INTERVAL_MAP = {
 
 
 class Backtester:
-    def __init__(self):
+    def __init__(self, required_intervals=[1, 5, 240]):
         self.data_dir = "backtesting/data"
         self.results_dir = "backtesting/results"
         self.backtest_results_overall = []
         self.backtest_summary = pd.DataFrame(columns=["module_name", "portfolio_value", "num_trades", "realized_pnl", "total_pnl"])
-        self.historical_data = None
+        self.historical_data = {}
+        self.required_intervals = required_intervals
 
 
-    def test_module(self, module, interval=60, risk_percent=0.02, pl_ratio=2.0):
-        if self.historical_data is None:
+    def test_module(self, module, risk_percent=0.02, pl_ratio=2.0):
+        if not self.historical_data:
             raise RuntimeError("No historical data loaded. Call load_historical_data() first.")
 
-        ohlc_data = self.historical_data["ohlc"]
-        trade_data = self.historical_data["trades"]
-
-        curr_data_ohlc = pd.DataFrame(columns=ohlc_data.columns)
-        curr_data_trades = pd.DataFrame(columns=trade_data.columns)
         backtest_results = pd.DataFrame(columns=["date", "time", "portfolio_value", "live_order", "unrealized_pnl", "realized_pnl", "total_pnl", "trade_made"])
 
         portfolio_value_realized = 100000.0
@@ -47,23 +43,50 @@ class Backtester:
         trade_pnl_list = []
         trade_duration_list = []
 
-        for idx_ohlc, row_ohlc in ohlc_data.iterrows():
-            curr_data_ohlc.loc[idx_ohlc] = row_ohlc
-            curr_time = idx_ohlc
-            end_time = curr_time + pd.Timedelta(minutes=interval)
-            bar_idx += 1
+        df_1m_base = self.historical_data[1]["ohlc"]
+        trade_data = self.historical_data[1]["trades"]
 
+        print(f"\n[INFO] Backtest starting")
+
+        for curr_time, row_1m in df_1m_base.iterrows():
+            bar_idx += 1
+            
+            # Create the dynamic timeframe cache dictionary, just like our live engine
+            all_dfs = {}
+            
+            # Slice historical segments up to the current simulated minute to prevent lookahead leaks
+            for interval in self.required_intervals:
+                full_df = self.historical_data[interval]["ohlc"]
+                # Filter down to bars where the bar completion time is <= our current time position
+                historical_slice = full_df.loc[full_df.index <= curr_time].copy()
+                
+                # Convert price types to float to match live data casting steps
+                for col in ["open", "high", "low", "close", "volume"]:
+                    historical_slice[col] = historical_slice[col].astype(float)
+                
+                all_dfs[interval] = historical_slice
+
+            # Determine whether a 5-minute bar has closed to match live time synchronization checks
+            current_timestamp_seconds = int(curr_time.timestamp())
+            is_5m_rollover = (current_timestamp_seconds % 300 == 0)
+            interval_posted = 5 if is_5m_rollover else 1
+
+            # Isolate matching high-frequency trade updates within this 1-minute block
+            end_time = curr_time + pd.Timedelta(minutes=1)
             current_block_trades = trade_data.loc[
                 (trade_data.index >= curr_time) & (trade_data.index < end_time)
             ].sort_index()
 
+            trade_made = False
+            pnl = None
+            duration = None
+
+            # Process transaction executions at the tick level if requested
             for idx_trade, row_trade in current_block_trades.iterrows():
-                curr_data_trades.loc[idx_trade] = row_trade
-                curr_price = float(curr_data_trades["price"].iloc[-1])
+                curr_price = float(row_trade["price"])
 
                 if module.signal_on == "tick":
-                    module.data = curr_data_ohlc.copy()
-                    signal = module.check_signals()
+                    signal = module.check_signals(dfs=all_dfs, interval_posted=interval_posted)
                     holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar = self._execute_signal(
                         signal, curr_price, holding, portfolio_value_realized,
                         num_shares_held, stop_loss_price, buy_amt, risk_percent,
@@ -73,28 +96,30 @@ class Backtester:
                         trade_pnl_list.append(pnl)
                         trade_duration_list.append(duration)
 
-            close_price = float(row_ohlc["close"])
+            close_price = float(row_1m["close"])
             curr_price = close_price if curr_price == 0.0 else curr_price
 
+            # Process standard block candle closures (ensuring 5m strat only checks on true rollovers)
             if module.signal_on == "candle":
-                module.data = curr_data_ohlc.copy()
-                signal = module.check_signals()
-                holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar = self._execute_signal(
-                    signal, close_price, holding, portfolio_value_realized,
-                    num_shares_held, stop_loss_price, buy_amt, risk_percent,
-                    bar_idx=bar_idx, entry_bar=entry_bar
-                )
-                if trade_made and pnl is not None:
-                    trade_pnl_list.append(pnl)
-                    trade_duration_list.append(duration)
+                if interval_posted == 5:
+                    signal = module.check_signals(dfs=all_dfs, interval_posted=interval_posted)
+                    holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar = self._execute_signal(
+                        signal, close_price, holding, portfolio_value_realized,
+                        num_shares_held, stop_loss_price, buy_amt, risk_percent,
+                        bar_idx=bar_idx, entry_bar=entry_bar
+                    )
+                    if trade_made and pnl is not None:
+                        trade_pnl_list.append(pnl)
+                        trade_duration_list.append(duration)
             else:
-                trade_made = False
+                if module.signal_on != "tick":
+                    trade_made = False
 
             portfolio_value_unrealized = portfolio_value_realized + (close_price * num_shares_held)
 
-            backtest_results.loc[idx_ohlc] = {
-                "date": idx_ohlc.date(),
-                "time": idx_ohlc.time(),
+            backtest_results.loc[curr_time] = {
+                "date": curr_time.date(),
+                "time": curr_time.time(),
                 "portfolio_value": portfolio_value_unrealized,
                 "live_order": holding,
                 "unrealized_pnl": portfolio_value_unrealized - portfolio_value_realized,
@@ -121,11 +146,10 @@ class Backtester:
 
     def run_backtests(self):
         modules = [
-            (SingleMACrossover, "candle", {}),
+            (Breakout5mScalper, "candle", {}),
         ]
 
         for module, signal_on, param_dict in modules:
-            # Run a Bayesian Optimization/Grid Search style loop here to get parameters
             curr_instance = module()
             curr_instance.signal_on = signal_on
             res, final_value, total_pnl, viz_data = self.test_module(curr_instance)
@@ -141,16 +165,19 @@ class Backtester:
             }
             self.backtest_summary.loc[len(self.backtest_summary)] = curr_agg_data
 
-        # Eventually, goal is to compare multiple methods in the same plots
-
 
     def load_historical_data(self, data_type, ticker, start_date, end_date, frequency):
         interval_label = INTERVAL_MAP.get(frequency, f"{frequency}m")
         
         safe_ticker = ticker.replace("/", "")
         since_ts = int(start_date.timestamp())
-        start_dt_normalized = datetime.fromtimestamp(since_ts)
-        start_str = start_dt_normalized.strftime('%Y%m%d')
+        
+        start_dt_normalized = datetime.utcfromtimestamp(since_ts)
+        if start_dt_normalized.year == 2022 and start_dt_normalized.month == 12 and start_dt_normalized.day == 31:
+            start_str = "20230101"
+        else:
+            start_str = start_dt_normalized.strftime('%Y%m%d')
+            
         end_str = end_date.strftime('%Y%m%d')
 
         if data_type == "stock":
@@ -199,7 +226,7 @@ class Backtester:
                     end_date=end_date,
                 ).fetch()
 
-            self.historical_data = {
+            self.historical_data[frequency] = {
                 "ohlc": pd.read_csv(data_path_ohlc, parse_dates=["timestamp"], index_col="timestamp"),
                 "trades": pd.read_csv(data_path_trades, parse_dates=["timestamp"], index_col="timestamp"),
             }
@@ -207,9 +234,9 @@ class Backtester:
         else:
             raise ValueError("Unsupported data type. Choose 'stock' or 'crypto'")
 
-        print(f"Loaded {len(self.historical_data['ohlc'])} OHLC bars for {ticker}")
-        if self.historical_data["trades"] is not None:
-            print(f"Loaded {len(self.historical_data['trades'])} trades for {ticker}")
+        print(f"Loaded {len(self.historical_data[frequency]['ohlc'])} OHLC bars for {ticker}")
+        if self.historical_data[frequency]["trades"] is not None:
+            print(f"Loaded {len(self.historical_data[frequency]['trades'])} trades for {ticker}")
 
 
     def display_results(self, ticker, strategy_name, viz_data, asset_type="crypto"):
@@ -226,7 +253,6 @@ class Backtester:
 
     def _execute_signal(self, signal, curr_price, holding, portfolio_value_realized,
                         num_shares_held, stop_loss_price, buy_amt, risk_percent, bar_idx=0, entry_bar=0):
-        # Used for a lot of my visualization stats
         trade_made = False
         pnl = None
         duration = None
@@ -256,13 +282,41 @@ class Backtester:
         return holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar
 
 
+    def validate_data(self):
+        data_failed = False 
+        base_interval = self.required_intervals[0]
+        
+        start_time = self.historical_data[base_interval]["ohlc"].index[0]
+        end_time = self.historical_data[base_interval]["ohlc"].index[-1]
+        
+        for interval in self.required_intervals[1:]:
+            curr_start = self.historical_data[interval]["ohlc"].index[0]
+            if abs((curr_start - start_time).total_seconds()) > (interval * 60):
+                print(f"[ERROR] Start time doesn't line up between interval {base_interval} and {interval}: {start_time} vs {curr_start}")
+                data_failed = True
+
+            curr_end = self.historical_data[interval]["ohlc"].index[-1]
+            if abs((curr_end - end_time).total_seconds()) > (interval * 60):
+                print(f"[ERROR] End time doesn't line up between interval {base_interval} and {interval}: {end_time} vs {curr_end}")
+                data_failed = True
+                    
+        if data_failed:
+            raise ValueError("Historical context alignment checks failed. Verify target data drops.")
+
+
 if __name__ == "__main__":
-    backtester = Backtester()
-    backtester.load_historical_data(
-        data_type="crypto",
-        ticker="XBT/USD",
-        start_date=pd.Timestamp("2023-01-01"),
-        end_date=pd.Timestamp("2023-01-07"),
-        frequency=60  # Needs tuning based on the model, 60 works for now
-    )
-    backtester.run_backtests()
+    intervals = [1, 5, 240]  
+    backtester = Backtester(required_intervals=intervals)
+    for interval in intervals:
+        backtester.load_historical_data(
+            data_type="crypto",
+            ticker="XBT/USD",
+            start_date=pd.Timestamp("2023-01-01"),
+            end_date=pd.Timestamp("2026-06-01"),
+            frequency=interval  
+        )
+    try:
+        backtester.validate_data()
+        backtester.run_backtests()
+    except Exception as e:
+        print(f"[ERROR] data did not line up or backtest failed. Error: {e}")

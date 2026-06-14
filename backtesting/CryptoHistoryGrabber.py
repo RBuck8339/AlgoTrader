@@ -51,17 +51,21 @@ class KrakenHistoricalScraper:
         self.api_key = api_key or os.getenv("DATA_API_KEY")
         self.api_secret = api_secret or os.getenv("DATA_API_SECRET")
 
-        self.end_date = self._parse_date(end_date) if end_date else datetime.now()
+        if end_date:
+            parsed_end = self._parse_date(end_date)
+            self.end_date = parsed_end.replace(tzinfo=None)
+        else:
+            self.end_date = datetime.now(timezone.utc)
 
-        # Keep self.since strictly in SECONDS for readable dates and filenames
         if start_date:
-            self.since = int(self._parse_date(start_date).timestamp())
+            parsed_start = self._parse_date(start_date)
+            localized_start = parsed_start.replace(tzinfo=None)
+            self.since = int(localized_start.timestamp())
         elif since:
             self.since = since
         else:
             self.since = int((self.end_date - timedelta(days=days)).timestamp())
 
-        os.makedirs(self.output_dir, exist_ok=True)
 
     def fetch(self):
         handlers = {
@@ -219,7 +223,7 @@ class KrakenHistoricalScraper:
                     
                 for trade in trades:
                     # Kraken public trade timestamp array element index 2 is float seconds
-                    ts = datetime.fromtimestamp(float(trade[2]))
+                    ts = datetime.utcfromtimestamp(float(trade[2]))
                     if ts > self.end_date:
                         stop_fetching = True
                         break
@@ -258,13 +262,15 @@ class KrakenHistoricalScraper:
         if df.empty:
             return
             
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed")
 
-        start_dt = pd.Timestamp(datetime.fromtimestamp(self.since))
+        start_dt = pd.Timestamp(datetime.utcfromtimestamp(self.since))
         end_dt = pd.Timestamp(self.end_date)
 
         mask = (df["timestamp"] >= start_dt) & (df["timestamp"] <= end_dt)
         df_filtered = df.loc[mask].copy()
+        
+        df_filtered["timestamp"] = df_filtered["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S.%f")
         df_filtered.to_csv(filename, index=False)
 
         print(f"   Cleaned! Kept {len(df_filtered)} rows within requested range.")
@@ -307,10 +313,14 @@ class KrakenHistoricalScraper:
         raise ValueError(f"Invalid date format: {date}. Use datetime or 'YYYY-MM-DD'.")
 
     def _build_filename(self):
-        start_dt = datetime.fromtimestamp(self.since)
-        start_str = start_dt.strftime("%Y%m%d")
+        start_dt = datetime.utcfromtimestamp(self.since)
+        
+        if start_dt.year == 2022 and start_dt.month == 12 and start_dt.day == 31:
+            start_str = "20230101"
+        else:
+            start_str = start_dt.strftime("%Y%m%d")
+            
         end_str = self.end_date.strftime("%Y%m%d")
-
         safe_symbol = self.symbol.replace("/", "_")
 
         if self.data_type == "ohlc":
@@ -319,6 +329,7 @@ class KrakenHistoricalScraper:
                 self.output_dir,
                 f"kraken_{safe_symbol}_{interval_label}_{self.data_type}_{start_str}_to_{end_str}.csv"
             )
+            
         return os.path.join(
             self.output_dir,
             f"kraken_{safe_symbol}_{self.data_type}_{start_str}_to_{end_str}.csv"
@@ -331,6 +342,6 @@ if __name__ == "__main__":
         data_type="ohlc",
         interval=60,
         start_date=pd.Timestamp("2023-01-01"),
-        end_date=pd.Timestamp("2023-01-31"),
+        end_date=pd.Timestamp("2023-01-10"),
     )
     scraper.fetch()
