@@ -33,10 +33,10 @@ class Backtester:
         backtest_results = pd.DataFrame(columns=["date", "time", "portfolio_value", "live_order", "unrealized_pnl", "realized_pnl", "total_pnl", "trade_made"])
 
         portfolio_value_realized = 100000.0
-        holding = False
+        position = None  # None, "LONG", or "SHORT"
         stop_loss_price = -1.0
         num_shares_held = 0.0
-        buy_amt = 0.0
+        entry_value = 0.0  
         curr_price = 0.0
         entry_bar = 0
         bar_idx = 0
@@ -49,29 +49,26 @@ class Backtester:
         print(f"\n[INFO] Backtest starting")
 
         for curr_time, row_1m in df_1m_base.iterrows():
+            print(curr_time)  # Basically serves as a progress bar
             bar_idx += 1
             
-            # Create the dynamic timeframe cache dictionary, just like our live engine
             all_dfs = {}
-            
-            # Slice historical segments up to the current simulated minute to prevent lookahead leaks
             for interval in self.required_intervals:
                 full_df = self.historical_data[interval]["ohlc"]
-                # Filter down to bars where the bar completion time is <= our current time position
                 historical_slice = full_df.loc[full_df.index <= curr_time].copy()
                 
-                # Convert price types to float to match live data casting steps
                 for col in ["open", "high", "low", "close", "volume"]:
                     historical_slice[col] = historical_slice[col].astype(float)
                 
                 all_dfs[interval] = historical_slice
 
-            # Determine whether a 5-minute bar has closed to match live time synchronization checks
             current_timestamp_seconds = int(curr_time.timestamp())
-            is_5m_rollover = (current_timestamp_seconds % 300 == 0)
-            interval_posted = 5 if is_5m_rollover else 1
+            intervals_posted = []
+            
+            for interval in self.required_intervals:
+                if current_timestamp_seconds % (interval * 60) == 0:
+                    intervals_posted.append(interval)
 
-            # Isolate matching high-frequency trade updates within this 1-minute block
             end_time = curr_time + pd.Timedelta(minutes=1)
             current_block_trades = trade_data.loc[
                 (trade_data.index >= curr_time) & (trade_data.index < end_time)
@@ -81,15 +78,14 @@ class Backtester:
             pnl = None
             duration = None
 
-            # Process transaction executions at the tick level if requested
             for idx_trade, row_trade in current_block_trades.iterrows():
                 curr_price = float(row_trade["price"])
 
                 if module.signal_on == "tick":
-                    signal = module.check_signals(dfs=all_dfs, interval_posted=interval_posted)
-                    holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar = self._execute_signal(
-                        signal, curr_price, holding, portfolio_value_realized,
-                        num_shares_held, stop_loss_price, buy_amt, risk_percent,
+                    signal = module.check_signals(dfs=all_dfs, intervals_posted=intervals_posted)
+                    position, portfolio_value_realized, num_shares_held, stop_loss_price, entry_value, trade_made, pnl, duration, entry_bar = self._execute_signal(
+                        signal, curr_price, position, portfolio_value_realized,
+                        num_shares_held, stop_loss_price, entry_value, risk_percent,
                         bar_idx=bar_idx, entry_bar=entry_bar
                     )
                     if trade_made and pnl is not None:
@@ -99,13 +95,13 @@ class Backtester:
             close_price = float(row_1m["close"])
             curr_price = close_price if curr_price == 0.0 else curr_price
 
-            # Process standard block candle closures (ensuring 5m strat only checks on true rollovers)
             if module.signal_on == "candle":
-                if interval_posted == 5:
-                    signal = module.check_signals(dfs=all_dfs, interval_posted=interval_posted)
-                    holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar = self._execute_signal(
-                        signal, close_price, holding, portfolio_value_realized,
-                        num_shares_held, stop_loss_price, buy_amt, risk_percent,
+                # Only check signals if a core execution interval (like 5m or 240m) actually closed
+                if any(i in intervals_posted for i in self.required_intervals if i != 1):
+                    signal = module.check_signals(dfs=all_dfs, intervals_posted=intervals_posted)
+                    position, portfolio_value_realized, num_shares_held, stop_loss_price, entry_value, trade_made, pnl, duration, entry_bar = self._execute_signal(
+                        signal, close_price, position, portfolio_value_realized,
+                        num_shares_held, stop_loss_price, entry_value, risk_percent,
                         bar_idx=bar_idx, entry_bar=entry_bar
                     )
                     if trade_made and pnl is not None:
@@ -114,21 +110,30 @@ class Backtester:
             else:
                 if module.signal_on != "tick":
                     trade_made = False
-
-            portfolio_value_unrealized = portfolio_value_realized + (close_price * num_shares_held)
+            
+            portfolio_value_unrealized = portfolio_value_realized
+            if position == "LONG":
+                portfolio_value_unrealized += (close_price * num_shares_held)
+            elif position == "SHORT":
+                portfolio_value_unrealized += (entry_value - (close_price * num_shares_held))
 
             backtest_results.loc[curr_time] = {
                 "date": curr_time.date(),
                 "time": curr_time.time(),
                 "portfolio_value": portfolio_value_unrealized,
-                "live_order": holding,
+                "live_order": position,
                 "unrealized_pnl": portfolio_value_unrealized - portfolio_value_realized,
                 "realized_pnl": portfolio_value_realized - 100000.0,
                 "total_pnl": portfolio_value_unrealized - 100000.0,
                 "trade_made": trade_made,
             }
 
-        final_value = portfolio_value_realized + (curr_price * num_shares_held)
+        final_value = portfolio_value_realized
+        if position == "LONG":
+            final_value += (curr_price * num_shares_held)
+        elif position == "SHORT":
+            final_value += (entry_value - (curr_price * num_shares_held))
+
         total_pnl = final_value - 100000.0
         print(f"\nBacktest complete. Final portfolio: ${final_value:,.2f}")
         print(f"Total P&L: ${total_pnl:,.2f}")
@@ -142,8 +147,8 @@ class Backtester:
         }
 
         return backtest_results, final_value, total_pnl, viz_data
-
-
+    
+    
     def run_backtests(self):
         modules = [
             (Breakout5mScalper, "candle", {}),
@@ -248,38 +253,75 @@ class Backtester:
         self.backtest_summary.to_csv(os.path.join(self.results_dir, "summary.csv"))
         print(f"Results saved to {self.results_dir}")
 
-        Visualizer.generate_plots(ticker, strategy_name, viz_data, asset_type=asset_type)
+        Visualizer.generate_plots(
+            ticker=ticker, 
+            strategy_name=strategy_name, 
+            data=viz_data, 
+            save=True, 
+            asset_type=asset_type
+        )
 
 
-    def _execute_signal(self, signal, curr_price, holding, portfolio_value_realized,
-                        num_shares_held, stop_loss_price, buy_amt, risk_percent, bar_idx=0, entry_bar=0):
+    def _execute_signal(self, signal, curr_price, position, portfolio_value_realized,
+                        num_shares_held, stop_loss_price, entry_value, risk_percent, bar_idx=0, entry_bar=0):
         trade_made = False
         pnl = None
         duration = None
 
-        if signal == 1 and not holding:
-            buy_amt = portfolio_value_realized * risk_percent
-            num_shares_held = buy_amt / curr_price
+        # 1. Evaluate Stop Loss conditions before looking at new strategy signals
+        if position == "LONG" and curr_price <= stop_loss_price:
+            signal = "SELL_LONG"
+        elif position == "SHORT" and curr_price >= stop_loss_price:
+            signal = "SELL_SHORT"
+
+        # 2. Process Entry/Exit Signals
+        if signal == "BUY_LONG" and position is None:
+            entry_value = portfolio_value_realized * risk_percent
+            num_shares_held = entry_value / curr_price
             stop_loss_price = curr_price * (1 - risk_percent)
-            portfolio_value_realized -= buy_amt
-            holding = True
+            portfolio_value_realized -= entry_value
+            position = "LONG"
             entry_bar = bar_idx
             trade_made = True
-            print(f"  BUY  @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
+            print(f"  BUY_LONG   @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
 
-        elif holding and (signal == -1 or curr_price <= stop_loss_price):
-            sell_amt = num_shares_held * curr_price
-            pnl = sell_amt - buy_amt
+        elif signal == "SELL_LONG" and position == "LONG":
+            exit_value = num_shares_held * curr_price
+            pnl = exit_value - entry_value
             duration = bar_idx - entry_bar
-            portfolio_value_realized += sell_amt
-            holding = False
+            portfolio_value_realized += exit_value
+            position = None
             num_shares_held = 0.0
             stop_loss_price = -1.0
-            buy_amt = 0.0
+            entry_value = 0.0
             trade_made = True
-            print(f"  SELL @ {curr_price:.2f} | pnl={pnl:.2f}")
+            print(f"  SELL_LONG  @ {curr_price:.2f} | pnl={pnl:.2f}")
 
-        return holding, portfolio_value_realized, num_shares_held, stop_loss_price, buy_amt, trade_made, pnl, duration, entry_bar
+        elif signal == "BUY_SHORT" and position is None:
+            # For shorting, the initial action is selling to open. Add proceeds to cash.
+            entry_value = portfolio_value_realized * risk_percent
+            num_shares_held = entry_value / curr_price
+            stop_loss_price = curr_price * (1 + risk_percent) # Short stop loss triggers when price goes UP
+            portfolio_value_realized += entry_value 
+            position = "SHORT"
+            entry_bar = bar_idx
+            trade_made = True
+            print(f"  BUY_SHORT  @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
+
+        elif signal == "SELL_SHORT" and position == "SHORT":
+            # To close a short, you buy the shares back. Subtract the cost from cash.
+            exit_value = num_shares_held * curr_price
+            pnl = entry_value - exit_value
+            duration = bar_idx - entry_bar
+            portfolio_value_realized -= exit_value 
+            position = None
+            num_shares_held = 0.0
+            stop_loss_price = -1.0
+            entry_value = 0.0
+            trade_made = True
+            print(f"  SELL_SHORT @ {curr_price:.2f} | pnl={pnl:.2f}")
+
+        return position, portfolio_value_realized, num_shares_held, stop_loss_price, entry_value, trade_made, pnl, duration, entry_bar
 
 
     def validate_data(self):
@@ -312,11 +354,24 @@ if __name__ == "__main__":
             data_type="crypto",
             ticker="XBT/USD",
             start_date=pd.Timestamp("2023-01-01"),
-            end_date=pd.Timestamp("2026-06-01"),
+            end_date=pd.Timestamp("2023-06-01"),
             frequency=interval  
         )
     try:
         backtester.validate_data()
-        backtester.run_backtests()
+        for module, signal_on, param_dict in [ (Breakout5mScalper, "candle", {}) ]:
+            curr_instance = module()
+            curr_instance.signal_on = signal_on
+            
+            # Run test and unpack the generated datasets directly for visualization drop fields
+            res, final_value, total_pnl, viz_data = backtester.test_module(curr_instance)
+            
+            # Forward metrics downstream to your plotting logic cleanly
+            backtester.display_results(
+                ticker="XBTUSD", 
+                strategy_name="Breakout5mScalper", 
+                viz_data=viz_data, 
+                asset_type="crypto"
+            )
     except Exception as e:
         print(f"[ERROR] data did not line up or backtest failed. Error: {e}")
