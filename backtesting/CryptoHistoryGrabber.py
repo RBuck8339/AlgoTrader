@@ -115,7 +115,7 @@ class KrakenHistoricalScraper:
         if df.empty:
             raise RuntimeError(f"Trades file is empty after filtering: {trade_file}. Check your date range — Kraken trade history may not go back that far.")
 
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed")
         df["price"] = df["price"].astype(float)
         df["volume"] = df["volume"].astype(float)
         df = df.set_index("timestamp")

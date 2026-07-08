@@ -214,7 +214,7 @@ class Visualizer:
                     color="#1D9E75" if not value.startswith("-") else "#E24B4A")
 
     @staticmethod
-    def generate_plots(ticker, strategy_name, data, save=True, asset_type="crypto"):
+    def generate_plots(ticker, strategy_name, data, save=True, asset_type="crypto", config=None):
         os.makedirs(Visualizer.OUTPUT_DIR, exist_ok=True)
 
         trading_days = 365 if asset_type == "crypto" else 252
@@ -247,7 +247,7 @@ class Visualizer:
             if save:
                 path = os.path.join(
                     Visualizer.OUTPUT_DIR,
-                    f"{ticker}_{strategy_name}_{plot_name}.png"
+                    f"{ticker}_{strategy_name}_{plot_name}{f'_{config}' if config is not None else ''}.png"
                 )
                 fig.savefig(path, dpi=150, bbox_inches="tight")
                 print(f"Saved {path}")

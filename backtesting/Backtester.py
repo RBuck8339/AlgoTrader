@@ -29,13 +29,13 @@ class Backtester:
         self.active_positions = {}
 
 
-    def test_module(self, module, risk_percent=0.02, pl_ratio=3.0):
+    def test_module(self, module, risk_percent=0.02, pl_ratio=3.0, purchase_percentage=0.1, verbose=False):
         if not self.historical_data:
             raise RuntimeError("No historical data loaded. Call load_historical_data() first.")
-
-        backtest_results = pd.DataFrame(columns=["date", "time", "portfolio_value", "live_order", "unrealized_pnl", "realized_pnl", "total_pnl", "trade_made"])
-
-        portfolio_value_realized = 100000.0
+        
+        starting_value = 5000.0
+        backtest_results_list = []
+        portfolio_value_realized = starting_value
         bar_idx = 0
         trade_pnl_list = []
         trade_duration_list = []
@@ -45,68 +45,70 @@ class Backtester:
         df_1m_base = self.historical_data[1]["ohlc"]
         trade_data = self.historical_data[1]["trades"]
 
-        print(f"\n[INFO] Backtest starting")
-        
-        historical_ticks_list = []
-        
-        for curr_time, row_1m in df_1m_base.iterrows():
-            print(curr_time)  
+        interval_idx_maps = {}
+        for interval in self.required_intervals:
+            if interval == 1:
+                continue
+            full_df = self.historical_data[interval]["ohlc"]
+            idx_positions = full_df.index.searchsorted(df_1m_base.index, side='right') - 1
+            interval_idx_maps[interval] = idx_positions
+
+        trade_data_grouped = trade_data.groupby(trade_data.index)
+
+        timestamps_1m = df_1m_base.index
+        closes_1m = df_1m_base["close"].to_numpy()
+        cached_dfs = {i: self.historical_data[i]["ohlc"].copy() for i in self.required_intervals}
+
+        for idx_1m in range(len(df_1m_base)):
             bar_idx += 1
-            
+            curr_time = timestamps_1m[idx_1m]
+            close_price = closes_1m[idx_1m]
+            print(curr_time)
             all_dfs = {}
             for interval in self.required_intervals:
-                full_df = self.historical_data[interval]["ohlc"]
-                historical_slice = full_df.loc[full_df.index <= curr_time].copy()
-                
-                for col in ["open", "high", "low", "close", "volume"]:
-                    historical_slice[col] = historical_slice[col].astype(float)
-                
-                all_dfs[interval] = historical_slice
+                if interval == 1:
+                    all_dfs[1] = cached_dfs[1].iloc[:idx_1m + 1]
+                else:
+                    last_valid_row_idx = interval_idx_maps[interval][idx_1m]
+                    all_dfs[interval] = cached_dfs[interval].iloc[:last_valid_row_idx + 1]
 
             current_timestamp_seconds = int(curr_time.timestamp())
-            intervals_posted = []
-            for interval in self.required_intervals:
-                if current_timestamp_seconds % (interval * 60) == 0:
-                    intervals_posted.append(interval)
+            intervals_posted = [i for i in self.required_intervals if current_timestamp_seconds % (i * 60) == 0]
 
-            end_time = curr_time + pd.Timedelta(minutes=1)
-            current_block_trades = trade_data.loc[
-                (trade_data.index >= curr_time) & (trade_data.index < end_time)
-            ].sort_index()
+            if curr_time in trade_data_grouped.groups:
+                current_block_trades = trade_data_grouped.get_group(curr_time)
+                
+                for idx_trade, row_trade in current_block_trades.iterrows():
+                    curr_price = float(row_trade["price"])
 
-            trade_made = False
-
-            for idx_trade, row_trade in current_block_trades.iterrows():
-                historical_ticks_list.append(row_trade.to_dict())
-                curr_price = float(row_trade["price"])
-
-                portfolio_value_realized = self._manage_brackets_risk(curr_price, portfolio_value_realized, bar_idx, trade_pnl_list, trade_duration_list)
-
-                if module.signal_on == "tick":
-                    trades_df = pd.DataFrame(historical_ticks_list)
-                    signal = module.check_signals(dfs=all_dfs, intervals_posted=intervals_posted, curr_time=curr_time, trades=trades_df)
-                    
-                    position_to_sell = None 
-                    if type(signal) == tuple:
-                        signal, position_to_sell = signal 
-                    
-                    new_order_data = {
-                        "risk_percent": risk_percent,
-                        "ratio": pl_ratio,
-                        "bar_idx": bar_idx,
-                        "signal": signal,
-                    }
-                    
-                    portfolio_value_realized = self._execute_signal(
-                        curr_price, portfolio_value_realized, new_order_data=new_order_data, 
-                        positions_to_sell=[] if position_to_sell is None else position_to_sell,
-                        bar_idx=bar_idx, pnl_list=trade_pnl_list, duration_list=trade_duration_list
+                    portfolio_value_realized = self._manage_brackets_risk(
+                        curr_price, portfolio_value_realized, bar_idx, trade_pnl_list, trade_duration_list, verbose
                     )
 
-            close_price = float(row_1m["close"])
-            curr_price = close_price if curr_price == 0.0 else curr_price
+                    if module.signal_on == "tick":
+                        signal = module.check_signals(dfs=all_dfs, intervals_posted=intervals_posted, curr_time=curr_time)
+                        
+                        position_to_sell = None 
+                        if type(signal) == tuple:
+                            signal, position_to_sell = signal 
+                        
+                        new_order_data = {
+                            "risk_percent": risk_percent,
+                            "purchase_percentage": purchase_percentage,
+                            "ratio": pl_ratio,
+                            "bar_idx": bar_idx,
+                            "signal": signal,
+                        }
+                        
+                        portfolio_value_realized = self._execute_signal(
+                            curr_price, portfolio_value_realized, new_order_data=new_order_data, 
+                            positions_to_sell=[] if position_to_sell is None else position_to_sell,
+                            bar_idx=bar_idx, pnl_list=trade_pnl_list, duration_list=trade_duration_list, verbose=verbose
+                        )
 
-            portfolio_value_realized = self._manage_brackets_risk(close_price, portfolio_value_realized, bar_idx, trade_pnl_list, trade_duration_list)
+            portfolio_value_realized = self._manage_brackets_risk(
+                close_price, portfolio_value_realized, bar_idx, trade_pnl_list, trade_duration_list, verbose
+            )
 
             if module.signal_on == "candle":
                 if any(i in intervals_posted for i in self.required_intervals if i != 1):
@@ -118,6 +120,7 @@ class Backtester:
                     
                     new_order_data = {
                         "risk_percent": risk_percent,
+                        "purchase_percentage": purchase_percentage,
                         "ratio": pl_ratio,
                         "bar_idx": bar_idx,
                         "signal": signal,
@@ -126,7 +129,7 @@ class Backtester:
                     portfolio_value_realized = self._execute_signal(
                         close_price, portfolio_value_realized, new_order_data=new_order_data, 
                         positions_to_sell=[] if position_to_sell is None else position_to_sell,
-                        bar_idx=bar_idx, pnl_list=trade_pnl_list, duration_list=trade_duration_list
+                        bar_idx=bar_idx, pnl_list=trade_pnl_list, duration_list=trade_duration_list, verbose=verbose
                     )
             
             portfolio_value_unrealized = portfolio_value_realized
@@ -136,42 +139,41 @@ class Backtester:
                 elif pos["position_type"] == "SHORT":
                     portfolio_value_unrealized += (pos["entry_value"] - (close_price * pos["shares_held"]))
 
-            trade_made = len(trade_pnl_list) > 0
-
-            backtest_results.loc[curr_time] = {
+            backtest_results_list.append({
+                "timestamp": curr_time,
                 "date": curr_time.date(),
                 "time": curr_time.time(),
                 "portfolio_value": portfolio_value_unrealized,
                 "live_order": len(self.active_positions) > 0,
                 "unrealized_pnl": portfolio_value_unrealized - portfolio_value_realized,
-                "realized_pnl": portfolio_value_realized - 100000.0,
-                "total_pnl": portfolio_value_unrealized - 100000.0,
-                "trade_made": trade_made,
-            }
+                "realized_pnl": portfolio_value_realized - starting_value,
+                "total_pnl": portfolio_value_unrealized - starting_value,
+                "trade_made": len(trade_pnl_list) > 0
+            })
+
+        backtest_results = pd.DataFrame(backtest_results_list).set_index("timestamp")
 
         final_value = portfolio_value_realized
         for key, pos in self.active_positions.items():
             if pos["position_type"] == "LONG":
-                final_value += (close_price * pos["shares_held"])
+                final_value += (closes_1m[-1] * pos["shares_held"])
             elif pos["position_type"] == "SHORT":
-                final_value += (pos["entry_value"] - (close_price * pos["shares_held"]))
+                final_value += (pos["entry_value"] - (closes_1m[-1] * pos["shares_held"]))
 
-        total_pnl = final_value - 100000.0
-        print(f"\nBacktest complete. Final portfolio: ${final_value:,.2f}")
-        print(f"Total P&L: ${total_pnl:,.2f}")
+        total_pnl = final_value - starting_value
 
         portfolio_series = backtest_results["portfolio_value"]
         viz_data = {
             "portfolio_value": portfolio_series,
-            "trade_pnl": pd.Series(trade_pnl_list),
+            "trade_pnl": pd.Series(trade_pnl_list, dtype=float),
             "daily_returns": portfolio_series.pct_change().dropna(),
-            "trade_duration": pd.Series(trade_duration_list),
+            "trade_duration": pd.Series(trade_duration_list, dtype=float),
         }
 
         return backtest_results, final_value, total_pnl, viz_data
 
 
-    def _manage_brackets_risk(self, current_price, cash, bar_idx, pnl_list, duration_list):
+    def _manage_brackets_risk(self, current_price, cash, bar_idx, pnl_list, duration_list, verbose):
         closed_keys = []
         
         for key, pos in self.active_positions.items():
@@ -183,24 +185,24 @@ class Backtester:
                     pnl_val = (pos["shares_held"] * current_price) - pos["entry_value"]
                     cash += (pos["shares_held"] * current_price)
                     sold = True
-                    print(f"   [STOP LONG #{key}] @ {current_price:.2f} | pnl={pnl_val:.2f}")
+                    if verbose: print(f"   [STOP LONG #{key}] @ {current_price:.2f} | pnl={pnl_val:.2f}")
                 elif current_price >= pos["take_profit_price"]:
                     pnl_val = (pos["shares_held"] * current_price) - pos["entry_value"]
                     cash += (pos["shares_held"] * current_price)
                     sold = True
-                    print(f"   [TAKE LONG #{key}] @ {current_price:.2f} | pnl={pnl_val:.2f}")
+                    if verbose: print(f"   [TAKE LONG #{key}] @ {current_price:.2f} | pnl={pnl_val:.2f}")
                     
             elif pos["position_type"] == "SHORT":
                 if current_price >= pos["stop_loss_price"]:
                     pnl_val = pos["entry_value"] - (pos["shares_held"] * current_price)
                     cash -= (pos["shares_held"] * current_price)
                     sold = True
-                    print(f"   [STOP SHORT #{key}] @ {current_price:.2f} | pnl={pnl_val:.2f}")
+                    if verbose: print(f"   [STOP SHORT #{key}] @ {current_price:.2f} | pnl={pnl_val:.2f}")
                 elif current_price <= pos["take_profit_price"]:
                     pnl_val = pos["entry_value"] - (pos["shares_held"] * current_price)
                     cash -= (pos["shares_held"] * current_price)
                     sold = True
-                    print(f"   [TAKE SHORT #{key}] @ {current_price:.2f} | pnl={pnl_val:.2f}")
+                    if verbose: print(f"   [TAKE SHORT #{key}] @ {current_price:.2f} | pnl={pnl_val:.2f}")
             
             if sold:
                 pnl_list.append(pnl_val)
@@ -213,23 +215,23 @@ class Backtester:
         return cash
 
 
-    def _execute_signal(self, curr_price, portfolio_value_realized, new_order_data=None, positions_to_sell=[], bar_idx=0, pnl_list=[], duration_list=[]):
+    def _execute_signal(self, curr_price, portfolio_value_realized, new_order_data=None, positions_to_sell=[], bar_idx=0, pnl_list=[], duration_list=[], verbose=False):
         if new_order_data is not None and new_order_data["signal"] in ["BUY_LONG", "BUY_SHORT"]:
             signal = new_order_data["signal"]
-            allocated_capital = portfolio_value_realized * new_order_data["risk_percent"]
+            allocated_capital = portfolio_value_realized * new_order_data["purchase_percentage"]
             num_shares_held = allocated_capital / curr_price
             
             if signal == "BUY_LONG":
                 stop_loss_price = curr_price * (1 - new_order_data["risk_percent"])
                 take_profit_price = curr_price * (1 + new_order_data["risk_percent"] * new_order_data["ratio"])
                 portfolio_value_realized -= allocated_capital
-                print(f"   BUY_LONG   @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
+                if verbose: print(f"   BUY_LONG   @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
                 
             elif signal == "BUY_SHORT":
                 stop_loss_price = curr_price * (1 + new_order_data["risk_percent"]) 
                 take_profit_price = curr_price * (1 - new_order_data["risk_percent"] * new_order_data["ratio"])
                 portfolio_value_realized += allocated_capital 
-                print(f"   BUY_SHORT  @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
+                if verbose: print(f"   BUY_SHORT  @ {curr_price:.2f} | shares={num_shares_held:.4f} | stop={stop_loss_price:.2f}")
              
             self.trade_num += 1
             self.active_positions[self.trade_num] = {
@@ -251,11 +253,11 @@ class Backtester:
                     if pos["position_type"] == "LONG":
                         pnl_val = (pos["shares_held"] * curr_price) - pos["entry_value"]
                         portfolio_value_realized += (pos["shares_held"] * curr_price)
-                        print(f"   SELL_LONG  @ {curr_price:.2f} | pnl={pnl_val:.2f}")
+                        if verbose: print(f"   SELL_LONG  @ {curr_price:.2f} | pnl={pnl_val:.2f}")
                     elif pos["position_type"] == "SHORT":
                         pnl_val = pos["entry_value"] - (pos["shares_held"] * curr_price)
                         portfolio_value_realized -= (pos["shares_held"] * curr_price)
-                        print(f"   SELL_SHORT @ {curr_price:.2f} | pnl={pnl_val:.2f}")
+                        if verbose: print(f"   SELL_SHORT @ {curr_price:.2f} | pnl={pnl_val:.2f}")
                         
                     pnl_list.append(pnl_val)
                     duration_list.append(bar_idx - pos["entry_bar"])
@@ -267,30 +269,31 @@ class Backtester:
         return portfolio_value_realized
 
 
-    def run_backtests(self):
-        modules = [
-            (Breakout5mScalper, "candle", {}),
-        ]
+    # def run_backtests(self):
+    #     modules = [
+    #         (Breakout5mScalper, "candle", {}),
+    #     ]
 
-        for module, signal_on, param_dict in modules:
-            curr_instance = module()
-            curr_instance.signal_on = signal_on
-            res, final_value, total_pnl, viz_data = self.test_module(curr_instance)
+    #     for module, signal_on, param_dict in modules:
+    #         curr_instance = module()
+    #         curr_instance.signal_on = signal_on
+    #         res, final_value, total_pnl, viz_data = self.test_module(curr_instance, risk_percent=0.02, pl_ratio=3.0)
 
-            self.backtest_results_overall.append(res)
+    #         self.backtest_results_overall.append(res)
 
-            curr_agg_data = {
-                "module_name": curr_instance.__class__.__name__,
-                "portfolio_value": final_value,
-                "num_trades": len(viz_data["trade_pnl"]),
-                "realized_pnl": res.iloc[-1]["realized_pnl"],
-                "total_pnl": total_pnl,
-            }
-            self.backtest_summary.loc[len(self.backtest_summary)] = curr_agg_data
+    #         curr_agg_data = {
+    #             "module_name": curr_instance.__class__.__name__,
+    #             "portfolio_value": final_value,
+    #             "num_trades": len(viz_data["trade_pnl"]),
+    #             "realized_pnl": res.iloc[-1]["realized_pnl"],
+    #             "total_pnl": total_pnl,
+    #         }
+    #         self.backtest_summary.loc[len(self.backtest_summary)] = curr_agg_data
 
 
     def load_historical_data(self, data_type, ticker, start_date, end_date, frequency):
         interval_label = INTERVAL_MAP.get(frequency, f"{frequency}m")
+        
         safe_ticker = ticker.replace("/", "")
         since_ts = int(start_date.timestamp())
         
@@ -306,7 +309,7 @@ class Backtester:
             data_path_ohlc = os.path.join(self.data_dir, f"{safe_ticker}_{interval_label}_ohlc_{start_str}_to_{end_str}.csv")
             data_path_trades = os.path.join(self.data_dir, f"{safe_ticker}_trades_{start_str}_to_{end_str}.csv")
             if not os.path.exists(data_path_ohlc):
-                raise FileNotFoundError(f"Stock OHLC data not found: {data_path_ohlc}.")
+                raise FileNotFoundError(f"Stock OHLC data not found: {data_path_ohlc}. Run StockHistoryGrabber.cache() first.")
 
             self.historical_data = {
                 "ohlc": pd.read_csv(data_path_ohlc, parse_dates=["timestamp"], index_col="timestamp"),
@@ -317,10 +320,37 @@ class Backtester:
             data_path_ohlc = os.path.join(self.data_dir, "crypto", f"kraken_{safe_ticker}_{interval_label}_ohlc_{start_str}_to_{end_str}.csv")
             data_path_trades = os.path.join(self.data_dir, "crypto", f"kraken_{safe_ticker}_trades_{start_str}_to_{end_str}.csv")
 
+            if not os.path.exists(data_path_ohlc):
+                print(f"OHLC file not found, scraping...")
+                KrakenHistoricalScraper(
+                    symbol=ticker,
+                    data_type="ohlc",
+                    interval=frequency,
+                    start_date=start_date,
+                    end_date=end_date,
+                ).fetch()
+
+            if not os.path.exists(data_path_trades):
+                print(f"Trades file not found, scraping...")
+                KrakenHistoricalScraper(
+                    symbol=ticker,
+                    data_type="trades",
+                    start_date=start_date,
+                    end_date=end_date,
+                ).fetch()
+
             self.historical_data[frequency] = {
                 "ohlc": pd.read_csv(data_path_ohlc, parse_dates=["timestamp"], index_col="timestamp"),
                 "trades": pd.read_csv(data_path_trades, parse_dates=["timestamp"], index_col="timestamp"),
             }
+
+        else:
+            raise ValueError("Unsupported data type. Choose 'stock' or 'crypto'")
+
+        print(f"Loaded {len(self.historical_data[frequency]['ohlc'])} OHLC bars for {ticker}")
+        if self.historical_data[frequency]["trades"] is not None:
+            print(f"Loaded {len(self.historical_data[frequency]['trades'])} trades for {ticker}")
+
 
     def validate_data(self):
         data_failed = False 
@@ -343,48 +373,56 @@ class Backtester:
         if data_failed:
             raise ValueError("Historical context alignment checks failed. Verify target data drops.")
 
-    def display_results(self, ticker, strategy_name, viz_data, asset_type="crypto"):
+
+    def display_results(self, ticker, strategy_name, viz_data, asset_type="crypto", config_str=None):
         os.makedirs(self.results_dir, exist_ok=True)
 
         for i, res in enumerate(self.backtest_results_overall):
             res.to_csv(os.path.join(self.results_dir, f"backtest_{i}.csv"))
 
         self.backtest_summary.to_csv(os.path.join(self.results_dir, "summary.csv"))
-        print(f"Results saved to {self.results_dir}")
 
         Visualizer.generate_plots(
             ticker=ticker, 
             strategy_name=strategy_name, 
             data=viz_data, 
             save=True, 
-            asset_type=asset_type
+            asset_type=asset_type,
+            config=config_str
         )
 
 
 if __name__ == "__main__":
-    intervals = [1, 5, 240]  
-    backtester = Backtester(required_intervals=intervals)
-    for interval in intervals:
-        backtester.load_historical_data(
-            data_type="crypto",
-            ticker="XBT/USD",
-            start_date=pd.Timestamp("2023-01-01"),
-            end_date=pd.Timestamp("2026-06-01"),
-            frequency=interval  
-        )
-    try:
-        backtester.validate_data()
-        for module, signal_on, param_dict in [ (Breakout5mScalper, "candle", {}) ]:
-            curr_instance = module()
-            curr_instance.signal_on = signal_on
-            
-            res, final_value, total_pnl, viz_data = backtester.test_module(curr_instance, risk_percent=0.02, pl_ratio=3.0)
-            
-            backtester.display_results(
-                ticker="XBTUSD", 
-                strategy_name="Breakout5mScalper", 
-                viz_data=viz_data, 
-                asset_type="crypto"
-            )
-    except Exception as e:
-        print(f"[ERROR] data did not line up or backtest failed. Error: {e}")
+    for currency in ["SOL", "BTC", "XBT"]:
+        for risk_percent in [0.01, 0.02, 0.03, 0.005, 0.0075]:
+            for pl_ratio in [1.5, 2, 2.5, 3, 3.5, 4]:
+                for purchase_percentage in [0.1]:
+                    if currency == "SOL":
+                        continue 
+                    intervals = [1, 5, 240]  
+                    backtester = Backtester(required_intervals=intervals)
+                    for interval in intervals:
+                        backtester.load_historical_data(
+                            data_type="crypto",
+                            ticker=f"{currency}/USD",
+                            start_date=pd.Timestamp("2023-01-01"),
+                            end_date=pd.Timestamp("2026-06-01"),
+                            frequency=interval  
+                        )
+                    try:
+                        backtester.validate_data()
+                        for module, signal_on, param_dict in [ (Breakout5mScalper, "candle", {}) ]:
+                            curr_instance = module()
+                            curr_instance.signal_on = signal_on
+                            
+                            res, final_value, total_pnl, viz_data = backtester.test_module(curr_instance, risk_percent=risk_percent, pl_ratio=pl_ratio, purchase_percentage=purchase_percentage, verbose=False)
+                            
+                            backtester.display_results(
+                                ticker=f"{currency}USD", 
+                                strategy_name="Breakout5mScalper", 
+                                viz_data=viz_data, 
+                                asset_type="crypto",
+                                config_str=f"risk_percent{risk_percent}_pl_ratio{pl_ratio}_purchase_percentage{purchase_percentage}"
+                            )
+                    except Exception as e:
+                        print(f"[ERROR] data did not line up or backtest failed. Error: {e}")
